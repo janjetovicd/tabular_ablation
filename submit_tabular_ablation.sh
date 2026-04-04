@@ -5,19 +5,67 @@
 #   1. Launch a Megatron training job on GPU nodes using the tokenized .bin/.idx
 #   files produced in Phase 2b. 
 #.  2. Train a 1.54B model from random initialization and logs validation loss to WandB.
+#
+# Usage:
+#   FIX: FORMAT_NAME is now accepted as a command-line argument so you don't
+#   need to manually edit the script 5 times. Pass it at submission time:
+#     sbatch submit_tabular_ablation.sh csv
+#     sbatch submit_tabular_ablation.sh sql_schema
+#     sbatch submit_tabular_ablation.sh keyvalue
+#     sbatch submit_tabular_ablation.sh markdown
+#     sbatch submit_tabular_ablation.sh json
+#
+#   The old loop approach still works too (no manual editing needed):
+#     for fmt in csv sql_schema keyvalue markdown json; do
+#         sbatch submit_tabular_ablation.sh $fmt
+#     done
+#
+# Output:
+#   Checkpoints: $EXP_DIR/checkpoints/
+#   Logs:        $EXP_DIR/logging/
+#   Loss curves: WandB project "tabular-ablation"
+# =============================================================================
+
+# ── SLURM job configuration ───────────────────────────────────────────────────
+
+#SBATCH --account=a139
+#SBATCH --time=06:00:00             # 6 hours — enough for 1.5B token proxy run
+#SBATCH --job-name=tabular-ablation # FIX: generic name; WandB exp name encodes format
+#SBATCH --output=/iopsstor/scratch/cscs/djanjetovic/apertus/Megatron-LM/logs/slurm/training/%x-%j.out
+#SBATCH --error=/iopsstor/scratch/cscs/djanjetovic/apertus/Megatron-LM/logs/slurm/training/%x-%j.err
+#SBATCH --nodes=8                   # 8 nodes × 4 GPUs = 32 GPUs total
+                                    # Much smaller than audio script (128 nodes for 8B)
+                                    # because our proxy model is 1.54B not 8B
+#SBATCH --ntasks-per-node=4         # 4 GPUs per node — one process per GPU
+#SBATCH --cpus-per-task=72
+#SBATCH --no-requeue
 
 echo "START TIME: $(date)"
 
-# Experiment config
+# ── Experiment config ─────────────────────────────────────────────────────────
 
-# CHANGE THIS for each of the 5 ablation runs
-FORMAT_NAME=csv   # Options: csv, sql_schema, keyvalue, markdown, json
+# FIX: accept FORMAT_NAME as a command-line argument instead of hardcoding it.
+# $1 = first argument passed to sbatch, e.g.: sbatch submit_tabular_ablation.sh csv
+# ${1:-csv} means: use $1 if provided, otherwise default to "csv"
+FORMAT_NAME=${1:-csv}
 
-# Container
+# Validate that FORMAT_NAME is one of the expected values
+if [[ ! "$FORMAT_NAME" =~ ^(csv|sql_schema|keyvalue|markdown|json)$ ]]; then
+    echo "ERROR: Unknown format '$FORMAT_NAME'."
+    echo "Valid options: csv, sql_schema, keyvalue, markdown, json"
+    exit 1
+fi
 
+echo "  Format: $FORMAT_NAME"
+
+# ── Container ─────────────────────────────────────────────────────────────────
+
+# Container provided by Ayush — pre-built NGC environment with PyTorch and CUDA
+# The container is the same regardless of which format we're training on —
+# it just provides the software environment, not data or model specifics
 CONTAINER_ENV=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tabular_container.toml
 
-# Paths
+# ── Paths ─────────────────────────────────────────────────────────────────────
 
 # Megatron source — Swiss AI fork with multimodal support
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/djanjetovic/Megatron-LM
@@ -32,7 +80,7 @@ TABULAR_DATA=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/$FORM
 # Weight 1.0 means 100% of tokens come from this dataset (only one format per job)
 DATA_PATH_LIST=(1.0 $TABULAR_DATA)
 
-# Training hyperparameters 
+# ── Training hyperparameters ──────────────────────────────────────────────────
 
 MBS=2                               # Micro batch size per GPU
 GBS=256                             # Global batch size across all GPUs
@@ -45,7 +93,7 @@ TRAINING_STEPS=$((TARGET_TOKENS / (GBS * SEQ_LEN)))
 
 RESUME_TRAINING=false               # Set to true to resume from a checkpoint
 
-# Logging setup
+# ── Logging setup ─────────────────────────────────────────────────────────────
 
 PROJECT_NAME=tabular-ablation
 EXP_NAME=tabular-$FORMAT_NAME-1p5b  # Experiment name encodes format and model size
@@ -55,7 +103,7 @@ CKPT_DIR=$EXP_DIR/checkpoints
 LOGGING_DIR=$EXP_DIR/logging
 TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
 
-# Environment variables
+# ── Environment variables ─────────────────────────────────────────────────────
 
 # WandB API key — loaded from secure file set up during CSCS configuration
 export WANDB_API_KEY=$(grep -A2 "api.wandb.ai" ~/.netrc 2>/dev/null | grep password | awk '{print $2}')
@@ -73,8 +121,11 @@ export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=8888
 export WORLD_SIZE=$SLURM_NPROCS     # Total number of GPU processes across all nodes
 
-# Model architecture — 1.54B proxy model
-
+# ── Model architecture — 1.54B proxy model ────────────────────────────────────
+# These parameters define the model Megatron builds from scratch.
+# Chosen to be small enough for fast ablation while large enough to show
+# meaningful format differences in validation loss.
+# Source: Ayush's recommendation in project notes.
 
 NETWORK_SIZE_ARGS=(
     --num-layers 32                 # Transformer depth
@@ -139,7 +190,7 @@ LEARNING_RATE_ARGS=(
     --lr-warmup-iters 100           # Short warmup since training from scratch
 )
 
-# Checkpoint loading
+# ── Checkpoint loading ────────────────────────────────────────────────────────
 
 if [ "$RESUME_TRAINING" = true ]; then
     # Resume from previous checkpoint (same experiment, continuing training)
@@ -175,16 +226,16 @@ DISTRIBUTED_ARGS=(
     --overlap-param-gather
 )
 
-# Tokenizer
+# ── Tokenizer ─────────────────────────────────────────────────────────────────
 
 TOKENIZER_ARGS=(
     --tokenizer-type HuggingFaceTokenizer
-    # Must match the tokenizer used in Phase 2b (preprocess_data.py)
-    # Using local CSCS path since HF_HUB_OFFLINE=1
     --tokenizer-model swiss-ai/Apertus-70B-2509
+    # Must match the tokenizer used in Phase 2b (preprocess_data.py).
+    # Using local CSCS path since HF_HUB_OFFLINE=1.
 )
 
-# Data arguments
+# ── Data arguments ────────────────────────────────────────────────────────────
 
 DATA_ARGS=(
     --split 98,2,0                  # 98% train, 2% validation, 0% test
@@ -197,14 +248,16 @@ DATA_ARGS=(
     --num-workers 32
 )
 
-# Create directories
+# ── Create directories ────────────────────────────────────────────────────────
 
-mkdir -p $CKPT_DIR $PROJECT_DIR $LOGGING_DIR
+# FIX: added TENSORBOARD_DIR to mkdir — it wasn't being created before, which
+# caused Megatron to error when it tried to write tensorboard logs.
+mkdir -p $CKPT_DIR $PROJECT_DIR $LOGGING_DIR $TENSORBOARD_DIR
 export PYTHONPATH=$MEGATRON_LM_DIR
 
 DATA_ARGS="${DATA_ARGS[@]} --data-path ${DATA_PATH_LIST[@]} --data-cache-path $DATASET_CACHE_DIR"
 
-# Build training command
+# ── Build training command ────────────────────────────────────────────────────
 
 TRAINING_CMD="python3 $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${TRANSFORMER_ENGINE_ARGS[@]} \
@@ -220,7 +273,7 @@ TRAINING_CMD="python3 $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${TOKENIZER_ARGS[@]} \
     $DATA_ARGS"
 
-# WandB logging
+# ── WandB logging ─────────────────────────────────────────────────────────────
 
 # WandB records loss at every step — you compare 5 curves on wandb.ai
 # to determine which format produces the lowest validation loss
@@ -235,7 +288,7 @@ else
     echo "No WandB API key found. Logging disabled."
 fi
 
-# Launch training
+# ── Launch training ───────────────────────────────────────────────────────────
 
 # srun launches one process per GPU across all nodes, inside the container.
 # RANK = global GPU index (0 to WORLD_SIZE-1)
@@ -249,5 +302,5 @@ srun \
     bash -c "
     RANK=\$SLURM_PROCID LOCAL_RANK=\$SLURM_LOCALID $TRAINING_CMD
     "
- 
+
 echo "END TIME: $(date)"

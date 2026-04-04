@@ -15,8 +15,31 @@
 # This is where the REAL tokenization happens. In Phase 2a, the tokenizer
 # was only used to COUNT tokens. Here it actually converts text to IDs that
 # get saved permanently to disk as training data.
+#
+# Usage (run once per format, after Phase 2a finishes):
+#   sbatch submit_tokenize.sh csv
+#   sbatch submit_tokenize.sh sql_schema
+#   sbatch submit_tokenize.sh keyvalue
+#   sbatch submit_tokenize.sh markdown
+#   sbatch submit_tokenize.sh json
+#
+# Output per format:
+#   /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/{format}/train.bin
+#   /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/{format}/train.idx
+# =============================================================================
 
-# Arguments
+# ── SLURM job configuration ───────────────────────────────────────────────────
+
+#SBATCH --account=a139
+#SBATCH --time=04:00:00             # Tokenization takes longer than serialization
+#SBATCH --job-name=tokenize-tabular
+#SBATCH --output=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/logs/tokenize-%j.out
+#SBATCH --error=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/logs/tokenize-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32          # More cores = faster tokenization (--workers 32 below)
+
+# ── Arguments ─────────────────────────────────────────────────────────────────
 
 FORMAT=$1
 
@@ -26,9 +49,9 @@ if [ -z "$FORMAT" ]; then
     exit 1
 fi
 
-# Paths
+# ── Paths ─────────────────────────────────────────────────────────────────────
 
-# Directory containing the 10 chunk .jsonl files from T4 serilization step
+# Directory containing the 10 chunk .jsonl files from Phase 2a
 JSONL_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/jsonl/$FORMAT
 
 # Output prefix for .bin and .idx files
@@ -43,7 +66,7 @@ echo "  Format:  $FORMAT"
 echo "  Input:   $JSONL_DIR"
 echo "  Output:  $OUTPUT_PREFIX"
 
-# Environment
+# ── Environment ───────────────────────────────────────────────────────────────
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate base
@@ -51,30 +74,43 @@ conda activate base
 # Create output directory if it doesn't exist
 mkdir -p /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/$FORMAT
 
-# Merge all chunk files
+# ── Merge all chunk files ─────────────────────────────────────────────────────
 
-# Concatenate all 10 chunk .jsonl files into one merged file
-# preprocess_data.py reads a single input file, not a directory
+# Concatenate all 10 chunk .jsonl files into one merged file.
+# preprocess_data.py reads a single input file, not a directory.
 echo "Merging chunk files..."
 cat $JSONL_DIR/chunk-*.jsonl > $JSONL_DIR/merged.jsonl
 echo "Merged. Total lines: $(wc -l < $JSONL_DIR/merged.jsonl)"
 
-# Run tokenization
+# ── Run tokenization ──────────────────────────────────────────────────────────
 
+# FIX: removed all inline comments from inside the python \ command block.
+# In bash, after a line continuation backslash \, a # on the next line is NOT
+# a comment — it is passed as a literal argument to Python, breaking the call.
+# All explanatory notes are placed above the command block instead.
+#
+# What each argument does:
+#   --input:          the merged .jsonl file, one {"text": "..."} per line
+#   --output-prefix:  where to write .bin and .idx (Megatron appends suffixes)
+#   --tokenizer-type: HuggingFaceTokenizer = required for Apertus BPE tokenizer
+#   --tokenizer-model: Apertus 128k vocab tokenizer — must match training
+#   --workers:        32 parallel workers, matches --cpus-per-task above
+#   --append-eod:     inserts end-of-document token so Megatron knows where
+#                     one table ends and the next begins when packing sequences
 python $MEGATRON/tools/preprocess_data.py \
     --input $JSONL_DIR/merged.jsonl \
-    # The merged .jsonl file — one {"text": "..."} line per table
     --output-prefix $OUTPUT_PREFIX \
-    # Where to write .bin and .idx files
     --tokenizer-type HuggingFaceTokenizer \
-    # Use HuggingFace tokenizer format (required for Apertus BPE tokenizer)
     --tokenizer-model swiss-ai/Apertus-70B-2509 \
-    # Apertus tokenizer with 128k vocab — must match what training uses
     --workers 32 \
-    # Parallel workers — matches --cpus-per-task above for full utilization
     --append-eod
-    # Append End-Of-Document token between documents so Megatron knows
-    # where one table ends and the next begins when packing sequences
+
+# FIX: delete the merged.jsonl after tokenization to free disk space.
+# At 3B tokens the merged file is ~12-15 GB. With 5 formats running,
+# leaving them all on disk wastes 60-75 GB of scratch space.
+echo "Cleaning up merged file..."
+rm $JSONL_DIR/merged.jsonl
+echo "Removed $JSONL_DIR/merged.jsonl"
 
 echo "Done tokenizing $FORMAT"
 echo "Output files:"

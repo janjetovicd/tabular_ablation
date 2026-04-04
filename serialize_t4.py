@@ -195,25 +195,25 @@ def serialize_sql_schema(df, path):
     understanding. This is the unexplored direction being tested.
     """
 
-    # Read column type metadata directly from Parquet file
+    ## Read column type metadata directly from Parquet file
     # Parquet stores column statistics as metadata — no extra compute needed
     pf = pq.ParquetFile(path)
     schema = pf.schema_arrow
-
+ 
     col_defs = []
     for field in schema:
         col_name = field.name
-
+ 
         # Skip artifact columns (same logic as clean_df)
         if str(col_name).startswith("Unnamed") or col_name == "index":
             continue
         # Skip columns dropped by clean_df
         if col_name not in df.columns:
             continue
-
+ 
         col = df[col_name]
         field_type = str(field.type)
-
+ 
         # Map Arrow types to SQL types and compute value ranges
         if field_type in ["double", "float", "float32", "float64"]:
             sql_type = "FLOAT"
@@ -227,9 +227,9 @@ def serialize_sql_schema(df, path):
             # Strings, booleans, dates → VARCHAR, no range annotation
             sql_type = "VARCHAR"
             range_str = ""
-
+ 
         col_defs.append(f'    "{col_name}" {sql_type}{range_str}')
-
+ 
     header = "CREATE TABLE data (\n" + ",\n".join(col_defs) + "\n);\n"
     return header + df.to_csv(index=False)
 
