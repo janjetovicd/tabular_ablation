@@ -14,7 +14,8 @@ import logging
 import pyarrow.parquet as pq
 import pandas as pd
 from transformers import AutoTokenizer
-
+import io
+import zipfile
 
 # Helper functions
 
@@ -197,7 +198,7 @@ def serialize_sql_schema(df, parquet_schema):
 
     ## Read column type metadata directly from Parquet file
     # Parquet stores column statistics as metadata — no extra compute needed
- col_defs = []
+    col_defs = []
     for field in parquet_schema:
         col_name = field.name
         if str(col_name).startswith("Unnamed") or col_name == "index":
@@ -208,11 +209,11 @@ def serialize_sql_schema(df, parquet_schema):
         field_type = str(field.type)
         if field_type in ["double", "float", "float32", "float64"]:
             sql_type = "FLOAT"
-            range_str = (f" -- range: {col.min():.3g} to {col.max():.3g}"
-                         if col.notna().any() else "")
+            range_str = (f" -- range: {col.dropna().min():.3g} to {col.dropna().max():.3g}"
+                        if col.notna().any() else "")
         elif field_type.startswith("int"):
             sql_type = "INT"
-            range_str = (f" -- range: {int(col.min())} to {int(col.max())}"
+            range_str = (f" -- range: {int(col.dropna().min())} to {int(col.dropna().max())}"
                          if col.notna().any() else "")
         else:
             sql_type = "VARCHAR"
@@ -221,13 +222,11 @@ def serialize_sql_schema(df, parquet_schema):
     header = "CREATE TABLE data (\n" + ",\n".join(col_defs) + "\n);\n"
     return header + df.to_csv(index=False)
 
-def build_serializer(format_name, full_path=None):
+def build_serializer(format_name, arrow_schema=None):
     """
-    Return a serializer function that takes only a dataframe as argument. Specifically written for 
-    sql_schema, which needs path name as input, so all format functions are wrapped to take same parameter.
-
+    Return a serializer function that takes only a dataframe as argument.
+    For sql_schema, arrow_schema must be passed (read once per file, not per binary search call).
     """
-
     if format_name == "csv":
         return serialize_csv
     elif format_name == "keyvalue":
@@ -237,9 +236,7 @@ def build_serializer(format_name, full_path=None):
     elif format_name == "json":
         return serialize_json_records
     elif format_name == "sql_schema":
-        pf = pq.ParquetFile(full_path)
-        schema = pf.schema_arrow
-        return lambda df: serialize_sql_schema(df, schema)
+        return lambda df: serialize_sql_schema(df, arrow_schema)
     else:
         raise ValueError(f"Unknown format: {format_name}. "
                          f"Choose from: csv, keyvalue, markdown, json, sql_schema")
@@ -247,10 +244,13 @@ def build_serializer(format_name, full_path=None):
 
 # Core processing function
 
-def process_chunk(chunk_dir, format_name, output_path, tokenizer,
+def process_chunk(chunk_zip_path, format_name, output_path, tokenizer,
                   token_target, token_budget=3800):
     """
-    Process all parquet files in one T4 chunk directory.
+    Process all parquet files inside one T4 chunk zip file.
+
+    T4 chunks are stored as .zip files, each containing many .parquet files.
+    We read each parquet directly from the zip into memory — no extraction needed.
 
     For each parquet file:
         1. Load and clean the table
@@ -259,73 +259,62 @@ def process_chunk(chunk_dir, format_name, output_path, tokenizer,
         4. Write {"text": "..."} as one line in output .jsonl
 
     Stops once token_target tokens have been written.
-    This controls how much data each ablation training run sees (~300M per chunk,
-    ~3B total across 10 chunks per format).
-
     """
-
-    files = sorted(f for f in os.listdir(chunk_dir) if f.endswith(".parquet"))
 
     stats = {
         "tables_processed": 0,
-        "tables_skipped_empty": 0,      # empty after clean_df
-        "tables_skipped_too_long": 0,   # single row exceeds token budget
+        "tables_skipped_empty": 0,
+        "tables_skipped_too_long": 0,
         "tokens_written": 0,
     }
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    with open(output_path, "w", encoding="utf-8") as out_f:
-        for filename in files:
+    with zipfile.ZipFile(chunk_zip_path, 'r') as zf:
+        parquet_names = sorted(n for n in zf.namelist() if n.endswith('.parquet'))
 
-            # Stop once we hit the token target for this chunk
-            if stats["tokens_written"] >= token_target:
-                break
+        with open(output_path, "w", encoding="utf-8") as out_f:
+            for name in parquet_names:
 
-            full_path = os.path.join(chunk_dir, filename)
+                if stats["tokens_written"] >= token_target:
+                    break
 
-            # Step 1: load and clean
-            try:
-                df_raw = pq.read_table(full_path).to_pandas()
-            except Exception as e:
-                logging.warning(f"Failed to read {filename}: {e}")
-                stats["tables_skipped_empty"] += 1
-                continue
+                # Load parquet directly from zip into memory — no disk extraction
+                try:
+                    with zf.open(name) as f:
+                        arrow_table = pq.read_table(io.BytesIO(f.read()))
+                        df_raw = arrow_table.to_pandas()
+                        arrow_schema = arrow_table.schema
+                except Exception as e:
+                    logging.warning(f"Failed to read {name}: {e}")
+                    stats["tables_skipped_empty"] += 1
+                    continue
 
-            df = clean_df(df_raw)
+                df = clean_df(df_raw)
+                if df.empty or len(df.columns) == 0:
+                    stats["tables_skipped_empty"] += 1
+                    continue
 
-            if df.empty or len(df.columns) == 0:
-                stats["tables_skipped_empty"] += 1
-                continue
+                # Build serializer — schema passed here once, not re-read per binary search call
+                serialize_fn = build_serializer(format_name, arrow_schema=arrow_schema)
 
-            # Step 2: build serializer for this specific file
-            # Rebuilt per file because sql_schema needs the current file path
-            serialize_fn = build_serializer(format_name, full_path)
+                seed = get_seed_from_filename(name)
+                df_sampled = sample_rows_to_budget(
+                    df, serialize_fn, tokenizer,
+                    token_budget=token_budget, seed=seed
+                )
+                if df_sampled is None:
+                    stats["tables_skipped_too_long"] += 1
+                    continue
 
-            # Step 3: sample rows to fit token budget
-            seed = get_seed_from_filename(filename)
-            df_sampled = sample_rows_to_budget(
-                df, serialize_fn, tokenizer,
-                token_budget=token_budget, seed=seed
-            )
-
-            if df_sampled is None:
-                stats["tables_skipped_too_long"] += 1
-                continue
-
-            # Step 4: serialize and write one JSON line
-            # IMPORTANT: tokenizer here only COUNTS tokens for the running
-            # total — IDs are thrown away. Real tokenization (text → integer
-            # IDs saved to .bin file) happens in preprocess_data.py (Phase 2b).
-            text = serialize_fn(df_sampled)
-            n_tokens = len(tokenizer.encode(text))
-
-            out_f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
-
-            stats["tables_processed"] += 1
-            stats["tokens_written"] += n_tokens
+                text = serialize_fn(df_sampled)
+                n_tokens = len(tokenizer.encode(text))
+                out_f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+                stats["tables_processed"] += 1
+                stats["tokens_written"] += n_tokens
 
     return stats
+
 
 # Main
 
@@ -333,23 +322,17 @@ def main():
     parser = argparse.ArgumentParser(
         description="Serialize T4 parquet tables to .jsonl for Megatron pretraining."
     )
-    # --chunk_dir: which T4 chunk to process (set by SLURM array job)
-    parser.add_argument("--chunk_dir", type=str, required=True,
-                        help="Path to T4 chunk directory containing .parquet files.")
-    # --format: which serialization format to use (set by SLURM job submission)
+    parser.add_argument("--chunk_zip", type=str, required=True,
+                        help="Path to T4 chunk .zip file (e.g. chunk-0000.zip).")
     parser.add_argument("--format", type=str, required=True,
                         choices=["csv", "keyvalue", "markdown", "json", "sql_schema"],
                         help="Serialization format to use for this run.")
-    # --output: where to write the .jsonl file
     parser.add_argument("--output", type=str, required=True,
                         help="Path to write the output .jsonl file.")
-    # --token_target: how many tokens to write before stopping
     parser.add_argument("--token_target", type=int, default=300_000_000,
                         help="Stop after this many tokens. 10 chunks x 300M = 3B per format.")
-    # --token_budget: max tokens per training sample
     parser.add_argument("--token_budget", type=int, default=3800,
-                        help="Max tokens per sample (4096 window - 300 Megatron overhead).")
-    # --tokenizer: which tokenizer to use for counting
+                        help="Max tokens per sample (4096 window - 300 overhead).")
     parser.add_argument("--tokenizer", type=str, default="swiss-ai/Apertus-70B-2509",
                         help="HuggingFace tokenizer name or local CSCS path.")
     args = parser.parse_args()
@@ -360,13 +343,13 @@ def main():
     logging.info(f"Loading tokenizer: {args.tokenizer}")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
-    logging.info(f"Processing chunk: {args.chunk_dir}")
+    logging.info(f"Processing chunk: {args.chunk_zip}")
     logging.info(f"Format:           {args.format}")
     logging.info(f"Output:           {args.output}")
     logging.info(f"Token target:     {args.token_target:,}")
 
     stats = process_chunk(
-        chunk_dir=args.chunk_dir,
+        chunk_zip_path=args.chunk_zip,
         format_name=args.format,
         output_path=args.output,
         tokenizer=tokenizer,
