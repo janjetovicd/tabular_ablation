@@ -139,7 +139,7 @@ def serialize_csv(df):
     Well-motivated: CSV is extremely common in the base model's training data.
     """
 
-    return df.to_csv(index=False)
+    return df.to_csv(index=False).rstrip('\n')
 
 
 def serialize_markdown(df):
@@ -173,7 +173,7 @@ def serialize_json_records(df):
     return json.dumps(df.to_dict(orient="records"), default=str)
 
 
-def serialize_sql_schema(df, path):
+def serialize_sql_schema(df, parquet_schema):
     """
     Format F — SQL schema-aware serialization. Novel application for pretraining.
 
@@ -197,39 +197,27 @@ def serialize_sql_schema(df, path):
 
     ## Read column type metadata directly from Parquet file
     # Parquet stores column statistics as metadata — no extra compute needed
-    pf = pq.ParquetFile(path)
-    schema = pf.schema_arrow
- 
-    col_defs = []
-    for field in schema:
+ col_defs = []
+    for field in parquet_schema:
         col_name = field.name
- 
-        # Skip artifact columns (same logic as clean_df)
         if str(col_name).startswith("Unnamed") or col_name == "index":
             continue
-        # Skip columns dropped by clean_df
         if col_name not in df.columns:
             continue
- 
         col = df[col_name]
         field_type = str(field.type)
- 
-        # Map Arrow types to SQL types and compute value ranges
         if field_type in ["double", "float", "float32", "float64"]:
             sql_type = "FLOAT"
-            range_str = (f"  -- range: {col.min():.3g} to {col.max():.3g}"
+            range_str = (f" -- range: {col.min():.3g} to {col.max():.3g}"
                          if col.notna().any() else "")
         elif field_type.startswith("int"):
             sql_type = "INT"
-            range_str = (f"  -- range: {int(col.min())} to {int(col.max())}"
+            range_str = (f" -- range: {int(col.min())} to {int(col.max())}"
                          if col.notna().any() else "")
         else:
-            # Strings, booleans, dates → VARCHAR, no range annotation
             sql_type = "VARCHAR"
             range_str = ""
- 
         col_defs.append(f'    "{col_name}" {sql_type}{range_str}')
- 
     header = "CREATE TABLE data (\n" + ",\n".join(col_defs) + "\n);\n"
     return header + df.to_csv(index=False)
 
@@ -249,8 +237,9 @@ def build_serializer(format_name, full_path=None):
     elif format_name == "json":
         return serialize_json_records
     elif format_name == "sql_schema":
-        # Closure captures full_path so caller always passes just df
-        return lambda df: serialize_sql_schema(df, full_path)
+        pf = pq.ParquetFile(full_path)
+        schema = pf.schema_arrow
+        return lambda df: serialize_sql_schema(df, schema)
     else:
         raise ValueError(f"Unknown format: {format_name}. "
                          f"Choose from: csv, keyvalue, markdown, json, sql_schema")
