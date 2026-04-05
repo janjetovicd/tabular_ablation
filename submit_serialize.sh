@@ -59,7 +59,7 @@ T4_BASE=/capstor/store/cscs/swissai/a139/datasets/mlfoundations_t4_full
 # Convert SLURM array task ID (0-9) to chunk directory name (chunk-0000 to chunk-0009)
 # printf with %04d pads with zeros: 0 → 0000, 3 → 0003, 9 → 0009
 CHUNK=$(printf "chunk-%04d" $SLURM_ARRAY_TASK_ID)
-CHUNK_DIR=$T4_BASE/$CHUNK
+CHUNK_ZIP=$T4_BASE/${CHUNK}.zip   # T4 chunks are zip files, not directories
 
 # Output directory for this format's .jsonl files
 OUTPUT_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/jsonl/$FORMAT
@@ -72,7 +72,7 @@ mkdir -p $OUTPUT_DIR
 echo "Starting serialization"
 echo "  Format:    $FORMAT"
 echo "  Chunk:     $CHUNK"
-echo "  Input:     $CHUNK_DIR"
+echo "  Input:     $CHUNK_ZIP"
 echo "  Output:    $OUTPUT_DIR/$CHUNK.jsonl"
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -96,7 +96,7 @@ conda activate base
 # Tokenizer is used only for token counting during row sampling,
 # not for producing the final binary training data (that's Phase 2b).
 python /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/serialize_t4.py \
-    --chunk_dir $CHUNK_DIR \
+    --chunk_zip $CHUNK_ZIP \
     --format $FORMAT \
     --output $OUTPUT_DIR/$CHUNK.jsonl \
     --token_target 300000000 \
