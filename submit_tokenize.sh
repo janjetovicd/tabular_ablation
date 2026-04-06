@@ -68,9 +68,6 @@ echo "  Output:  $OUTPUT_PREFIX"
 
 # ── Environment ───────────────────────────────────────────────────────────────
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate base
-
 # Create output directory if it doesn't exist
 mkdir -p /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/$FORMAT
 
@@ -97,19 +94,22 @@ echo "Merged. Total lines: $(wc -l < $JSONL_DIR/merged.jsonl)"
 #   --workers:        32 parallel workers, matches --cpus-per-task above
 #   --append-eod:     inserts end-of-document token so Megatron knows where
 #                     one table ends and the next begins when packing sequences
-python $MEGATRON/tools/preprocess_data.py \
-    --input $JSONL_DIR/merged.jsonl \
-    --output-prefix $OUTPUT_PREFIX \
-    --tokenizer-type HuggingFaceTokenizer \
-    --tokenizer-model swiss-ai/Apertus-70B-2509 \
-    --workers 32 \
-    --append-eod
+srun --ntasks=1 \
+    --cpus-per-task=$SLURM_CPUS_PER_TASK \
+    --environment=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tabular_container.toml \
+    bash -c "python $MEGATRON/tools/preprocess_data.py \
+        --input $JSONL_DIR/merged.jsonl \
+        --output-prefix $OUTPUT_PREFIX \
+        --tokenizer-type HuggingFaceTokenizer \
+        --tokenizer-model swiss-ai/Apertus-70B-2509 \
+        --workers 32 \
+        --append-eod"
 
 # FIX: delete the merged.jsonl after tokenization to free disk space.
 # At 3B tokens the merged file is ~12-15 GB. With 5 formats running,
 # leaving them all on disk wastes 60-75 GB of scratch space.
 echo "Cleaning up merged file..."
-rm $JSONL_DIR/merged.jsonl
+#rm $JSONL_DIR/merged.jsonl
 echo "Removed $JSONL_DIR/merged.jsonl"
 
 echo "Done tokenizing $FORMAT"
