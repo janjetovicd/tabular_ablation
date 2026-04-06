@@ -57,9 +57,12 @@ def clean_df(df):
     max_cell_chars = 500
     cols_to_drop = []
     for col in df.columns:
-        if df[col].dtype == object:
-            if df[col].astype(str).str.len().max() > max_cell_chars:
-                cols_to_drop.append(col)
+            if df[col].dtype == object:
+                try:
+                    if df[col].astype(str).str.len().max() > max_cell_chars:
+                        cols_to_drop.append(col)
+                except (UnicodeDecodeError, Exception):
+                    cols_to_drop.append(col)  # drop columns that can't be decoded
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
 

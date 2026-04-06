@@ -25,7 +25,7 @@
 # ── SLURM job configuration ───────────────────────────────────────────────────
 
 #SBATCH --account=a139           # CSCS project account to bill compute hours to
-#SBATCH --time=02:00:00             # Max time per job — 2 hours per chunk is generous
+#SBATCH --time=12:00:00
 #SBATCH --job-name=serialize-tabular
 #SBATCH --output=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/logs/serialize-%A-%a.out
 # %A = parent job ID, %a = array task index (0-9)
