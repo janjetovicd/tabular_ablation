@@ -1,117 +1,132 @@
 #!/bin/bash
+#SBATCH --account=a139
+# CHANGE: added --account=a139 to match the other scripts and ensure correct
+# project billing on CSCS. Without this the job may be rejected or billed wrong.
+#SBATCH --job-name=tokenize
+#SBATCH --time=06:00:00
+# CHANGE: was 04:00:00. With ~10B tokens across 76 chunks merged into one file
+# and 28 parallel workers, tokenization takes 3-5h. 6h gives a safe buffer.
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=28
+#SBATCH --mem=200G
+#SBATCH --partition=normal
+#SBATCH --output=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/logs/tokenize_%x_%j.out
+
 # OBJECTIVE: Tokenize .jsonl files into Megatron binary format (.bin/.idx).
+# Uses datatrove MegatronDocumentTokenizer with a pre-cached local tokenizer
+# instead of preprocess_data.py, which fails silently on compute nodes
+# because they have no internet access and cannot load from HuggingFace Hub.
 #
-# Specifivally:
-#   1. Merges all 10 chunk .jsonl files for a format into one merged.jsonl
-#   2. Runs Megatron's preprocess_data.py to convert text → integer token IDs
-#      and write binary .bin and .idx files the training job reads directly
-#
-# Why this step is needed:
-#   Megatron cannot read .jsonl files directly. It needs binary files where
-#   every token is already converted to its integer ID and packed sequentially.
-#   preprocess_data.py does this conversion using the Apertus tokenizer.
-#   The .idx file is an index so Megatron can jump to any document instantly.
-#
-# This is where the REAL tokenization happens. In Phase 2a, the tokenizer
-# was only used to COUNT tokens. Here it actually converts text to IDs that
-# get saved permanently to disk as training data.
-#
-# Usage (run once per format, after Phase 2a finishes):
+# Usage (run once per format, after all serialize jobs for that format complete):
 #   sbatch submit_tokenize.sh csv
 #   sbatch submit_tokenize.sh sql_schema
 #   sbatch submit_tokenize.sh keyvalue
 #   sbatch submit_tokenize.sh markdown
 #   sbatch submit_tokenize.sh json
 #
-# Output per format:
-#   /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/{format}/train.bin
-#   /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/{format}/train.idx
-# =============================================================================
-
-# ── SLURM job configuration ───────────────────────────────────────────────────
-
-#SBATCH --account=a139
-#SBATCH --time=04:00:00             # Tokenization takes longer than serialization
-#SBATCH --job-name=tokenize-tabular
-#SBATCH --output=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/logs/tokenize-%j.out
-#SBATCH --error=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/logs/tokenize-%j.err
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32          # More cores = faster tokenization (--workers 32 below)
-
-# ── Arguments ─────────────────────────────────────────────────────────────────
+# Prerequisites:
+#   1. Tokenizer must be cached locally (step 1 in execution plan, login node).
+#   2. All chunk-*.jsonl files for this format must exist in JSONL_DIR.
+#      Check: ls /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/jsonl/<format>/
+#      Should show 76 files (chunk-0000.jsonl to chunk-0075.jsonl).
 
 FORMAT=$1
 
 if [ -z "$FORMAT" ]; then
     echo "ERROR: No format specified."
     echo "Usage: sbatch submit_tokenize.sh <format>"
+    echo "Formats: csv, sql_schema, keyvalue, markdown, json"
+    exit 1
+fi
+
+if [[ ! "$FORMAT" =~ ^(csv|sql_schema|keyvalue|markdown|json)$ ]]; then
+    echo "ERROR: Unknown format '$FORMAT'."
+    echo "Valid options: csv, sql_schema, keyvalue, markdown, json"
     exit 1
 fi
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-# Directory containing the 10 chunk .jsonl files from Phase 2a
 JSONL_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/jsonl/$FORMAT
+OUTPUT_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/$FORMAT
 
-# Output prefix for .bin and .idx files
-# Megatron appends _text_document.bin and _text_document.idx automatically
-OUTPUT_PREFIX=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/$FORMAT/train
+# CHANGE: tokenizer path must match exactly where you cached it in step 1.
+# The path in serialize_t4.py and submit_serialize.sh uses the same location.
+# All three scripts must agree on this path.
+TOKENIZER_PATH=/iopsstor/scratch/cscs/djanjetovic/tokenizer_cache/apertus
 
-# Swiss AI Megatron fork — preprocess_data.py lives in its tools/ directory
-MEGATRON=/iopsstor/scratch/cscs/djanjetovic/Megatron-LM
+echo "Starting tokenization with datatrove"
+echo "  Format:    $FORMAT"
+echo "  Input:     $JSONL_DIR"
+echo "  Output:    $OUTPUT_DIR"
+echo "  Tokenizer: $TOKENIZER_PATH"
 
-echo "Starting tokenization"
-echo "  Format:  $FORMAT"
-echo "  Input:   $JSONL_DIR"
-echo "  Output:  $OUTPUT_PREFIX"
+# Validate that the tokenizer cache exists before submitting
+if [ ! -d "$TOKENIZER_PATH" ]; then
+    echo "ERROR: Tokenizer cache not found at $TOKENIZER_PATH"
+    echo "Run the following on the LOGIN NODE first:"
+    echo "  python -c \""
+    echo "  from transformers import AutoTokenizer"
+    echo "  tok = AutoTokenizer.from_pretrained('swiss-ai/Apertus-70B-2509')"
+    echo "  tok.save_pretrained('$TOKENIZER_PATH')"
+    echo "  print('Tokenizer cached.')\""
+    exit 1
+fi
 
-# ── Environment ───────────────────────────────────────────────────────────────
+# Validate that chunk files exist
+CHUNK_COUNT=$(ls $JSONL_DIR/chunk-*.jsonl 2>/dev/null | wc -l)
+echo "  Chunk files found: $CHUNK_COUNT"
+if [ "$CHUNK_COUNT" -eq 0 ]; then
+    echo "ERROR: No chunk-*.jsonl files found in $JSONL_DIR"
+    echo "Run submit_serialize.sh first."
+    exit 1
+fi
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate base
 
-# Create output directory if it doesn't exist
-mkdir -p /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/$FORMAT
+mkdir -p $OUTPUT_DIR
 
-# ── Merge all chunk files ─────────────────────────────────────────────────────
+# Merge all chunk files into one for datatrove
+# CHANGE: added a check so we don't re-merge if merged.jsonl already exists
+# and appears complete (non-zero size). This saves time on retries.
+MERGED=$JSONL_DIR/merged.jsonl
+if [ -f "$MERGED" ] && [ -s "$MERGED" ]; then
+    echo "merged.jsonl already exists ($(du -sh $MERGED | cut -f1)). Skipping merge."
+else
+    echo "Merging $CHUNK_COUNT chunk files..."
+    cat $JSONL_DIR/chunk-*.jsonl > $MERGED
+    echo "Merged. Lines: $(wc -l < $MERGED)"
+    echo "Merged file size: $(du -sh $MERGED | cut -f1)"
+fi
 
-# Concatenate all 10 chunk .jsonl files into one merged file.
-# preprocess_data.py reads a single input file, not a directory.
-echo "Merging chunk files..."
-cat $JSONL_DIR/chunk-*.jsonl > $JSONL_DIR/merged.jsonl
-echo "Merged. Total lines: $(wc -l < $JSONL_DIR/merged.jsonl)"
+# Run tokenization using datatrove
+python3 - <<EOF
+from datatrove.executor.local import LocalPipelineExecutor
+from datatrove.pipeline.readers import JsonlReader
+from datatrove.pipeline.tokens import MegatronDocumentTokenizer
 
-# ── Run tokenization ──────────────────────────────────────────────────────────
-
-# FIX: removed all inline comments from inside the python \ command block.
-# In bash, after a line continuation backslash \, a # on the next line is NOT
-# a comment — it is passed as a literal argument to Python, breaking the call.
-# All explanatory notes are placed above the command block instead.
-#
-# What each argument does:
-#   --input:          the merged .jsonl file, one {"text": "..."} per line
-#   --output-prefix:  where to write .bin and .idx (Megatron appends suffixes)
-#   --tokenizer-type: HuggingFaceTokenizer = required for Apertus BPE tokenizer
-#   --tokenizer-model: Apertus 128k vocab tokenizer — must match training
-#   --workers:        32 parallel workers, matches --cpus-per-task above
-#   --append-eod:     inserts end-of-document token so Megatron knows where
-#                     one table ends and the next begins when packing sequences
-python $MEGATRON/tools/preprocess_data.py \
-    --input $JSONL_DIR/merged.jsonl \
-    --output-prefix $OUTPUT_PREFIX \
-    --tokenizer-type HuggingFaceTokenizer \
-    --tokenizer-model swiss-ai/Apertus-70B-2509 \
-    --workers 32 \
-    --append-eod
-
-# FIX: delete the merged.jsonl after tokenization to free disk space.
-# At 3B tokens the merged file is ~12-15 GB. With 5 formats running,
-# leaving them all on disk wastes 60-75 GB of scratch space.
-echo "Cleaning up merged file..."
-#rm $JSONL_DIR/merged.jsonl
-echo "Removed $JSONL_DIR/merged.jsonl"
+executor = LocalPipelineExecutor(
+    pipeline=[
+        JsonlReader(
+            "$MERGED",
+            text_key="text",
+        ),
+        MegatronDocumentTokenizer(
+            output_folder="$OUTPUT_DIR",
+            tokenizer_name_or_path="$TOKENIZER_PATH",
+            max_tokens_per_file=1e9,   # ~1B tokens per .bin shard
+            save_filename="train",
+        ),
+    ],
+    tasks=28,      # matches --cpus-per-task
+    workers=28,
+    logging_dir="$OUTPUT_DIR/logs",
+)
+executor.run()
+EOF
 
 echo "Done tokenizing $FORMAT"
 echo "Output files:"
-ls -lh /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/$FORMAT/
+ls -lh $OUTPUT_DIR/*.bin $OUTPUT_DIR/*.idx 2>/dev/null || echo "No .bin/.idx files found — check logs above."
