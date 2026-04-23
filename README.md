@@ -1,4 +1,4 @@
-# tabular_ablation
+# Tabular Ablation Study
 
 Serialization format ablation study for large-scale tabular pretraining. Part of a semester project at EPFL / CSCS.
 
