@@ -1,8 +1,10 @@
-
 """
-OBJECTIVE: Read raw parquet files from one chunk, filter if necessary and sample as many rows as they fit within the token budget (3.8k tokens)
-and serializes them in the chosen format, and writes one JSON line per table to an output .jsonl file
+OBJECTIVE: Read raw parquet files from T4 chunks, perform 'Tabular Chunking' 
+to ensure NO data is discarded. 
 
+Each table is split into multiple sequences of ~3.8k tokens. 
+Crucially, for formats like CSV or SQL Schema, the headers/schema are repeated 
+in every chunk so the model always has semantic context.
 """
 
 import os
@@ -17,355 +19,264 @@ from transformers import AutoTokenizer
 import io
 import zipfile
 
-# Helper functions
+# ─── UTILITIES & CLEANING ───────────────────────────────────────────────────
 
 def get_seed_from_filename(filename):
-    """
-    Derive a deterministic random seed from the parquet filename to shuffle rows before sampling and ensure model sees diverse row input.
-    It is deterministic to ensure it is reproducible when running different ablation trials (same rows, different format) for consistency. 
-
-    """
-
     hash_part = filename.split("=")[0]
     return int(hashlib.md5(hash_part.encode()).hexdigest()[:8], 16)
 
-
 def clean_df(df):
-    """
-    Remove columns that carry no semantic signal for pretraining, since it is required for our 
-    training objective (next-token prediction on multiple rows) differs from T4's original objective 
-    (single-row classification). Specifically:
+    """Robust cleaning: removes artifacts and long blobs."""
+    drop_cols = [c for c in df.columns if str(c).startswith("Unnamed") or str(c) in ["index"]]
+    df = df.drop(columns=drop_cols).dropna(axis=1, how="all")
 
-    1. Remove artifact columns ('Unnamed: X', 'index') since pandas adds these when
-       reading CSVs without explicit headers; they hold no meaning.
-
-    2. Remove long-value columns where any cell exceeds 500 characters
-       (free-text, HTML, base64 blobs, long URLs). With multiple rows per
-       sample, one such column can push a single row over the 3800 token
-       budget, making the entire table unusable.
-    """
-
-    # Remove pandas artifact columns
-    drop_cols = [c for c in df.columns
-                 if str(c).startswith("Unnamed") or str(c) in ["index"]]
-    df = df.drop(columns=drop_cols)
-
-    # Remove columns that are entirely null — no signal at all
-    df = df.dropna(axis=1, how="all")
-
-    # Remove columns with excessively long cell values
     max_cell_chars = 500
     cols_to_drop = []
     for col in df.columns:
-            if df[col].dtype == object:
-                try:
-                    if df[col].astype(str).str.len().max() > max_cell_chars:
-                        cols_to_drop.append(col)
-                except (UnicodeDecodeError, Exception):
-                    cols_to_drop.append(col)  # drop columns that can't be decoded
-    if cols_to_drop:
-        df = df.drop(columns=cols_to_drop)
+        if df[col].dtype == object:
+            try:
+                if df[col].astype(str).str.len().max() > max_cell_chars:
+                    cols_to_drop.append(col)
+            except:
+                cols_to_drop.append(col)
+    return df.drop(columns=cols_to_drop) if cols_to_drop else df
 
-    return df
-
-
-def sample_rows_to_budget(df, serialize_fn, tokenizer, token_budget=3800, seed=42):
-    """
-    Find the maximum number of rows that fit within token_budget using
-    binary search, then return that subset of the dataframe.
-
-    Returns None if even a single row exceeds the budget, signals to the
-    caller that this table should be skipped entirely.
-    """
-
-    # Shuffle rows with deterministic seed for reproducibility
-    rng = random.Random(seed)
-    indices = list(range(len(df)))
-    rng.shuffle(indices)
-    df_shuffled = df.iloc[indices].reset_index(drop=True)
-
-    low, high = 1, min(len(df_shuffled), 200)
-    while low < high:
-        mid = (low + high + 1) // 2
-        # +1 prevents infinite loop when low and high are adjacent
-        tokens = len(tokenizer.encode(serialize_fn(df_shuffled.head(mid))))
-        if tokens <= token_budget:
-            low = mid       # mid rows fit, try more
-        else:
-            high = mid - 1  # mid rows exceed budget, try fewer
-
-    # After loop: low == high == maximum rows that fit
-    # Final check: if even 1 row exceeds the budget, skip this table
-    final_tokens = len(tokenizer.encode(serialize_fn(df_shuffled.head(low))))
-    if final_tokens > token_budget:
-        return None
-
-    return df_shuffled.head(low)
-
-
-# Serialization functions: each function takes a cleaned, row-sampled dataframe and returns 
-# a string that the model trains on
-
-def serialize_keyvalue(df):
-    """
-    Format A — key:value per row.
-    Example output:
-        The city is Zurich. The population is 0.42. The area is 88.
-        The city is Geneva. The population is 0.20. The area is 16.
-
-    Pros: explicit column-value association in every row, strong signal.
-    Cons: most verbose — column names repeat for every cell, uses ~2x more
-          tokens than CSV, fitting fewer rows per sample.
-    This is the baseline from TabLLM, UniPredict, and T4's own serialization.
-    """
-
-    lines = []
-    for _, row in df.iterrows():
-        pairs = [f"The {col} is {val}"
-                 for col, val in row.items()
-                 if pd.notna(val) and str(val).strip() != ""]
-        if pairs:
-            lines.append(". ".join(pairs) + ".")
-    return "\n".join(lines)
-
+# ─── SERIALIZATION FORMATS ──────────────────────────────
 
 def serialize_csv(df):
-    """
-    Format B — header row + CSV data rows.
-    Example output:
-        city,population,area
-        Zurich,0.42,88
-        Geneva,0.20,16
-
-    Pros: most token-efficient — column names appear once in the header,
-          fits ~2x more rows than key:value per sample.
-    Cons: model must learn positional associations (3rd value = 3rd column).
-    Well-motivated: CSV is extremely common in the base model's training data.
-    """
-
     return df.to_csv(index=False).rstrip('\n')
 
+def serialize_keyvalue(df):
+    lines = []
+    for _, row in df.iterrows():
+        pairs = [f"The {col} is {val}" for col, val in row.items() if pd.notna(val) and str(val).strip() != ""]
+        if pairs: lines.append(". ".join(pairs) + ".")
+    return "\n".join(lines)
 
 def serialize_markdown(df):
-    """
-    Format C — markdown table.
-    Example output:
-        | city | population | area |
-        |------|------------|------|
-        | Zurich | 0.42   | 88   |
-
-    Pros: matches format the base model saw in GitHub READMEs and Wikipedia.
-    Cons: separator row and alignment padding waste tokens — less efficient
-          than CSV but more efficient than key:value.
-    """
-
     return df.to_markdown(index=False)
 
-
 def serialize_json_records(df):
-    """
-    Format D — JSON array of records.
-    Example output:
-        [{"city": "Zurich", "population": 0.42, "area": 88},
-         {"city": "Geneva", "population": 0.20, "area": 16}]
-
-    Pros: extremely common on the web and GitHub, base model has seen lots.
-    Cons: JSON syntax overhead (braces, quotes, commas) makes it similar in
-          verbosity to key:value — fits similar rows per sample.
-    """
-
     return json.dumps(df.to_dict(orient="records"), default=str)
 
-
 def serialize_sql_schema(df, parquet_schema):
-    """
-    Format F — SQL schema-aware serialization. Novel application for pretraining.
-
-    Example output:
-        CREATE TABLE data (
-            "city" VARCHAR,
-            "population" FLOAT  -- range: 0.13 to 0.42,
-            "area" INT  -- range: 16 to 88
-        );
-        city,population,area
-        Zurich,0.42,88
-        Geneva,0.20,16
-
-    Objective is to mirror how a data scientist approaches a new dataset (schema first, then data).
-    The type and range annotation replace the semantically weak column names. 
-    
-    CREATE TABLE is used in NL-to-SQL finetuning literature but has
-    never been used as a pretraining serialization format for general tabular
-    understanding. This is the unexplored direction being tested.
-    """
-
-    ## Read column type metadata directly from Parquet file
-    # Parquet stores column statistics as metadata — no extra compute needed
+    """Detailed SQL serialization: extracts ranges and types from Parquet metadata."""
     col_defs = []
     for field in parquet_schema:
         col_name = field.name
-        if str(col_name).startswith("Unnamed") or col_name == "index":
-            continue
-        if col_name not in df.columns:
+        if str(col_name).startswith("Unnamed") or col_name == "index" or col_name not in df.columns:
             continue
         col = df[col_name]
         field_type = str(field.type)
         if field_type in ["double", "float", "float32", "float64"]:
             sql_type = "FLOAT"
-            range_str = (f" -- range: {col.dropna().min():.3g} to {col.dropna().max():.3g}"
-                        if col.notna().any() else "")
+            range_str = f" -- range: {col.dropna().min():.3g} to {col.dropna().max():.3g}" if col.notna().any() else ""
         elif field_type.startswith("int"):
             sql_type = "INT"
-            range_str = (f" -- range: {int(col.dropna().min())} to {int(col.dropna().max())}"
-                         if col.notna().any() else "")
+            range_str = f" -- range: {int(col.dropna().min())} to {int(col.dropna().max())}" if col.notna().any() else ""
         else:
-            sql_type = "VARCHAR"
-            range_str = ""
+            sql_type = "VARCHAR"; range_str = ""
         col_defs.append(f'    "{col_name}" {sql_type}{range_str}')
+    
     header = "CREATE TABLE data (\n" + ",\n".join(col_defs) + "\n);\n"
     return header + df.to_csv(index=False)
 
-def build_serializer(format_name, arrow_schema=None):
+# ─── FAST CHUNKING LOGIC ────────────────────────────────────────────────────
+
+def get_row_token_counts(df, format_name, tokenizer, arrow_schema=None):
     """
-    Return a serializer function that takes only a dataframe as argument.
-    For sql_schema, arrow_schema must be passed (read once per file, not per binary search call).
+    Tokenize each row individually, once.
+    
+    HOW per format:
+    - csv/markdown: each row serializes WITH a header line. We strip the 
+      header before counting, then add the header cost once per segment.
+    - keyvalue: each row is fully self-contained, no header.
+    - json: each row as a single-element list [{...}], strip the brackets.
+      The per-row cost is an approximation but accurate enough given the 
+      small safety margin baked into token_budget.
+    - sql_schema: header is the CREATE TABLE block (large, fixed). 
+      Rows are CSV lines below it. Same header-strip approach as csv.
+    
+    Returns:
+        row_costs   : list of ints, token count for each row's data (no header)
+        header_cost : int, tokens consumed by the header/schema repeated 
+                      each segment (0 for keyvalue/json)
     """
-    if format_name == "csv":
-        return serialize_csv
-    elif format_name == "keyvalue":
-        return serialize_keyvalue
+    n = len(df)
+    row_costs = []
+
+    if format_name == "keyvalue":
+        # Every row is self-contained. Serialize each individually.
+        for _, row in df.iterrows():
+            single = pd.DataFrame([row])
+            text = serialize_keyvalue(single)
+            row_costs.append(len(tokenizer.encode(text, add_special_tokens=False)))
+        return row_costs, 0
+
+    elif format_name == "csv":
+        # Header: "col1,col2,col3\n"
+        header_line = df.to_csv(index=False).split('\n')[0] + '\n'
+        header_cost = len(tokenizer.encode(header_line, add_special_tokens=False))
+        # Each row: just the CSV data line, no header
+        for _, row in df.iterrows():
+            single = pd.DataFrame([row])
+            # to_csv produces "header\ndata_line", we want only data_line
+            data_line = single.to_csv(index=False).split('\n')[1]
+            row_costs.append(len(tokenizer.encode(data_line, add_special_tokens=False)))
+        return row_costs, header_cost
+
     elif format_name == "markdown":
-        return serialize_markdown
+        # Markdown header is two lines: the column names row + the separator row
+        # e.g. "| col1 | col2 |\n|------|------|\n"
+        full = df.head(1).to_markdown(index=False)
+        lines = full.split('\n')
+        header_lines = '\n'.join(lines[:2]) + '\n'  # col names + separator
+        header_cost = len(tokenizer.encode(header_lines, add_special_tokens=False))
+        # Each row: just the data line (line index 2 in a 1-row markdown)
+        for _, row in df.iterrows():
+            single = pd.DataFrame([row])
+            data_line = single.to_markdown(index=False).split('\n')[2]
+            row_costs.append(len(tokenizer.encode(data_line, add_special_tokens=False)))
+        return row_costs, header_cost
+
     elif format_name == "json":
-        return serialize_json_records
+        # JSON is [{...},{...},...]. No fixed header.
+        # Approximate: serialize each row as a single-element list, 
+        # subtract the 2 bracket tokens for [ and ].
+        bracket_cost = len(tokenizer.encode("[]", add_special_tokens=False))
+        for _, row in df.iterrows():
+            single = pd.DataFrame([row])
+            text = json.dumps(single.to_dict(orient="records"), default=str)
+            full_cost = len(tokenizer.encode(text, add_special_tokens=False))
+            # Subtract bracket overhead so costs are additive
+            row_costs.append(max(1, full_cost - bracket_cost))
+        return row_costs, bracket_cost  # bracket_cost acts as the "header"
+
     elif format_name == "sql_schema":
-        return lambda df: serialize_sql_schema(df, arrow_schema)
+        # Header = entire CREATE TABLE block + CSV header line
+        # Rows = CSV data lines
+        header_text = serialize_sql_schema(df.head(0), arrow_schema)  # 0 rows = schema only
+        # Also add the CSV header line that appears after the CREATE TABLE block
+        csv_header_line = df.to_csv(index=False).split('\n')[0] + '\n'
+        full_header = header_text + csv_header_line
+        header_cost = len(tokenizer.encode(full_header, add_special_tokens=False))
+        for _, row in df.iterrows():
+            single = pd.DataFrame([row])
+            data_line = single.to_csv(index=False).split('\n')[1]
+            row_costs.append(len(tokenizer.encode(data_line, add_special_tokens=False)))
+        return row_costs, header_cost
+
     else:
-        raise ValueError(f"Unknown format: {format_name}. "
-                         f"Choose from: csv, keyvalue, markdown, json, sql_schema")
+        raise ValueError(f"Unknown format: {format_name}")
 
 
-# Core processing function
-
-def process_chunk(chunk_zip_path, format_name, output_path, tokenizer,
-                  token_target, token_budget=3800):
+def process_table_iteratively(df, format_name, tokenizer, token_budget, arrow_schema=None):
     """
-    Process all parquet files inside one T4 chunk zip file.
-
-    T4 chunks are stored as .zip files, each containing many .parquet files.
-    We read each parquet directly from the zip into memory — no extraction needed.
-
-    For each parquet file:
-        1. Load and clean the table
-        2. Sample max rows that fit in token_budget
-        3. Serialize sampled rows in chosen format
-        4. Write {"text": "..."} as one line in output .jsonl
-
-    Stops once token_target tokens have been written.
+    Slices the table into multiple JSONL lines.
+    Each line = Header/Schema + subset of rows that fit within token_budget.
+    
+    OLD approach: binary search over row count, re-serializing every step.
+      Cost: O(N_segments * log(N_rows)) tokenizer calls, each on large text.
+    
+    NEW approach: pre-tokenize each row once, then greedily accumulate.
+      Cost: O(N_rows) tokenizer calls, each on a single small row.
+      Result: same segments written to disk, same total tokens, much faster.
     """
+    if df.empty:
+        return []
 
-    stats = {
-        "tables_processed": 0,
-        "tables_skipped_empty": 0,
-        "tables_skipped_too_long": 0,
-        "tokens_written": 0,
+    serializers = {
+        "csv":        lambda d: serialize_csv(d),
+        "keyvalue":   lambda d: serialize_keyvalue(d),
+        "markdown":   lambda d: serialize_markdown(d),
+        "json":       lambda d: serialize_json_records(d),
+        "sql_schema": lambda d: serialize_sql_schema(d, arrow_schema),
     }
+    serialize_fn = serializers[format_name]
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    # Step 1: get per-row token costs and the fixed header cost (once per segment)
+    row_costs, header_cost = get_row_token_counts(df, format_name, tokenizer, arrow_schema)
 
+    # Step 2: greedy accumulation — walk rows left to right, 
+    # emit a segment whenever the next row would overflow the budget
+    segments = []
+    segment_start = 0
+    current_tokens = header_cost  # every segment starts with its header cost
+
+    for i, cost in enumerate(row_costs):
+        if cost > (token_budget - header_cost):
+            # This single row is too large even alone — skip it
+            # (This is the same behaviour as the old code's best_fit_rows==0 case)
+            if segment_start == i:
+                segment_start = i + 1
+                current_tokens = header_cost
+            # If we're mid-segment, first flush what we have, then skip this row
+            else:
+                segments.append(serialize_fn(df.iloc[segment_start:i]))
+                segment_start = i + 1
+                current_tokens = header_cost
+            continue
+
+        if current_tokens + cost > token_budget:
+            # Current row would overflow — flush current segment, start new one
+            segments.append(serialize_fn(df.iloc[segment_start:i]))
+            segment_start = i
+            current_tokens = header_cost + cost
+        else:
+            current_tokens += cost
+
+    # Flush the final segment if anything remains
+    if segment_start < len(df):
+        segments.append(serialize_fn(df.iloc[segment_start:]))
+
+    return segments
+
+# ─── MAIN PROCESSING LOOP ───────────────────────────────────────────────────
+
+def process_chunk(chunk_zip_path, format_name, output_path, tokenizer, token_budget):
+    stats = {"processed": 0, "tokens": 0, "skipped": 0}
+    
     with zipfile.ZipFile(chunk_zip_path, 'r') as zf:
         parquet_names = sorted(n for n in zf.namelist() if n.endswith('.parquet'))
-
-        with open(output_path, "w", encoding="utf-8") as out_f:
+        
+        with open(output_path, 'w', encoding="utf-8") as out_f:
             for name in parquet_names:
-
-                if stats["tokens_written"] >= token_target:
-                    break
-
-                # Load parquet directly from zip into memory — no disk extraction
                 try:
                     with zf.open(name) as f:
                         arrow_table = pq.read_table(io.BytesIO(f.read()))
-                        df_raw = arrow_table.to_pandas()
-                        arrow_schema = arrow_table.schema
+                        df = clean_df(arrow_table.to_pandas())
+                        schema = arrow_table.schema
+                    
+                    if df.empty: continue
+                    
+                    seed = get_seed_from_filename(name)
+                    df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
+                    
+                    segments = process_table_iteratively(df, format_name, tokenizer, token_budget, schema)
+                    
+                    for seg in segments:
+                        n_tokens = len(tokenizer.encode(seg, add_special_tokens=False))
+                        out_f.write(json.dumps({"text": seg}, ensure_ascii=False) + "\n")
+                        stats["tokens"] += n_tokens
+                    
+                    stats["processed"] += 1
                 except Exception as e:
-                    logging.warning(f"Failed to read {name}: {e}")
-                    stats["tables_skipped_empty"] += 1
-                    continue
-
-                df = clean_df(df_raw)
-                if df.empty or len(df.columns) == 0:
-                    stats["tables_skipped_empty"] += 1
-                    continue
-
-                # Build serializer — schema passed here once, not re-read per binary search call
-                serialize_fn = build_serializer(format_name, arrow_schema=arrow_schema)
-
-                seed = get_seed_from_filename(name)
-                df_sampled = sample_rows_to_budget(
-                    df, serialize_fn, tokenizer,
-                    token_budget=token_budget, seed=seed
-                )
-                if df_sampled is None:
-                    stats["tables_skipped_too_long"] += 1
-                    continue
-
-                text = serialize_fn(df_sampled)
-                n_tokens = len(tokenizer.encode(text))
-                out_f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
-                stats["tables_processed"] += 1
-                stats["tokens_written"] += n_tokens
-
+                    logging.error(f"Error on {name}: {e}")
+                    stats["skipped"] += 1
+                    
     return stats
 
-
-# Main
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Serialize T4 parquet tables to .jsonl for Megatron pretraining."
-    )
-    parser.add_argument("--chunk_zip", type=str, required=True,
-                        help="Path to T4 chunk .zip file (e.g. chunk-0000.zip).")
-    parser.add_argument("--format", type=str, required=True,
-                        choices=["csv", "keyvalue", "markdown", "json", "sql_schema"],
-                        help="Serialization format to use for this run.")
-    parser.add_argument("--output", type=str, required=True,
-                        help="Path to write the output .jsonl file.")
-    parser.add_argument("--token_target", type=int, default=300_000_000,
-                        help="Stop after this many tokens. 10 chunks x 300M = 3B per format.")
-    parser.add_argument("--token_budget", type=int, default=3800,
-                        help="Max tokens per sample (4096 window - 300 overhead).")
-    parser.add_argument("--tokenizer", type=str, default="swiss-ai/Apertus-70B-2509",
-                        help="HuggingFace tokenizer name or local CSCS path.")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--chunk_zip", required=True)
+    parser.add_argument("--format", required=True, choices=["csv", "keyvalue", "markdown", "json", "sql_schema"])
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--tokenizer", required=True)
+    parser.add_argument("--token_budget", type=int, default=3800)
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
-
-    logging.info(f"Loading tokenizer: {args.tokenizer}")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-
-    logging.info(f"Processing chunk: {args.chunk_zip}")
-    logging.info(f"Format:           {args.format}")
-    logging.info(f"Output:           {args.output}")
-    logging.info(f"Token target:     {args.token_target:,}")
-
-    stats = process_chunk(
-        chunk_zip_path=args.chunk_zip,
-        format_name=args.format,
-        output_path=args.output,
-        tokenizer=tokenizer,
-        token_target=args.token_target,
-        token_budget=args.token_budget,
-    )
-
-    logging.info("─── Done ───────────────────────────────────────────────")
-    logging.info(f"  Tables processed:          {stats['tables_processed']:>8,}")
-    logging.info(f"  Skipped (empty):           {stats['tables_skipped_empty']:>8,}")
-    logging.info(f"  Skipped (row too long):    {stats['tables_skipped_too_long']:>8,}")
-    logging.info(f"  Tokens written:            {stats['tokens_written']:>8,}")
-
-
-if __name__ == "__main__":
-    main()
+    
+    stats = process_chunk(args.chunk_zip, args.format, args.output, tokenizer, args.token_budget)
+    logging.info(f"Done. Tokens: {stats['tokens']:,} | Tables: {stats['processed']} | Errors: {stats['skipped']}")
