@@ -116,7 +116,6 @@ executor = LocalPipelineExecutor(
         MegatronDocumentTokenizer(
             output_folder="$OUTPUT_DIR",
             tokenizer_name_or_path="$TOKENIZER_PATH",
-            max_tokens_per_file=1e9,   # ~1B tokens per .bin shard
             save_filename="train",
         ),
     ],
