@@ -35,7 +35,7 @@ T4 parquet chunks (zip)
 Reads T4 parquet files from a chunk zip archive, cleans and serializes every table using **Tabular Chunking** — splitting each table into multiple 3800-token segments so no row is discarded.
 
 **Key design decisions:**
-- **Binary search per segment**: finds the maximum number of rows fitting in the token budget without brute-force iteration.
+- **Tabular Chunking**: each table is split into multiple 3800-token segments using greedy row accumulation with per-row token pre-computation. Writes one {"text": "..."} JSON line per segment. This ensures no table data is discarded and that every row of every table is used.
 - **Header/schema repetition**: every segment includes the column header or SQL schema so the model always has semantic context.
 - **Deterministic shuffle**: rows are shuffled with a seed derived from the filename (MD5 hash), ensuring all 5 format runs see identical row orderings for a fair comparison.
 - **Cleaning**: drops artifact columns (`Unnamed:*`, `index`), all-null columns, and columns with any cell exceeding 500 characters (avoids free-text blobs and base64 data swamping the token budget).
@@ -66,25 +66,22 @@ python serialize_t4.py \
 
 SLURM array job script. Submits one job per chunk for a given format. The `--array` range is passed at submission time (not hardcoded) to allow flexible test or full runs.
 
-**Phase A — test run (chunk 0 only):**
+**For a full run (all 76 chunks, all formats):**
 ```bash
-sbatch --array=0 submit_serialize.sh csv
-# Check yield:
-grep "Tokens written\|Done\." logs/serialize-*-0.out
-```
-
-**Phase B — full run (all 76 chunks, all formats):**
-```bash
-for fmt in csv sql_schema keyvalue markdown json; do
-    sbatch --array=0-75 submit_serialize.sh $fmt
-done
+sbatch --array=0-75 submit_serialize.sh csv
+sbatch --array=0-75 submit_serialize.sh sql_schema
+sbatch --array=0-75 submit_serialize.sh keyvalue
+sbatch --array=0-75 submit_serialize.sh markdown
+sbatch --array=0-75 submit_serialize.sh json
 ```
 
 **For this ablation study (24 chunks):**
 ```bash
-for fmt in csv sql_schema keyvalue markdown json; do
-    sbatch --array=0-23 submit_serialize.sh $fmt
-done
+sbatch --array=0-23 submit_serialize.sh csv
+sbatch --array=0-23 submit_serialize.sh sql_schema
+sbatch --array=0-23 submit_serialize.sh keyvalue
+sbatch --array=0-23 submit_serialize.sh markdown
+sbatch --array=0-23 submit_serialize.sh json
 ```
 
 **SLURM config:** 1 node, 1 task, 16 CPUs, 12h wall time. No GPU needed for serialization.
