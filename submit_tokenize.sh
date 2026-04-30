@@ -91,24 +91,25 @@ from datatrove.executor.local import LocalPipelineExecutor
 from datatrove.pipeline.readers import JsonlReader
 from datatrove.pipeline.tokens import MegatronDocumentTokenizer
 
-executor = LocalPipelineExecutor(
-    pipeline=[
-        JsonlReader(
-            "$JSONL_DIR",
-            text_key="text",
-            glob_pattern="chunk-*.jsonl",
-        ),
-        MegatronDocumentTokenizer(
-            output_folder="$OUTPUT_DIR",
-            tokenizer_name_or_path="$TOKENIZER_PATH",
-            save_filename="train",
-        ),
-    ],
-    tasks=28,
-    workers=28,
-    logging_dir="$OUTPUT_DIR/logs",
-)
-executor.run()
+if __name__ == '__main__':
+    executor = LocalPipelineExecutor(
+        pipeline=[
+            JsonlReader(
+                "$JSONL_DIR",
+                text_key="text",
+                glob_pattern="chunk-*.jsonl",
+            ),
+            MegatronDocumentTokenizer(
+                output_folder="$OUTPUT_DIR",
+                tokenizer_name_or_path="$TOKENIZER_PATH",
+                save_filename="train",
+            ),
+        ],
+        tasks=28,
+        workers=28,
+        logging_dir="$OUTPUT_DIR/logs",
+    )
+    executor.run()
 EOF
 
 python3 $TOKENIZE_SCRIPT
