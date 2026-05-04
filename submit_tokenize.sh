@@ -45,7 +45,7 @@ fi
 
 JSONL_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/jsonl/$FORMAT
 OUTPUT_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/$FORMAT
-TOKENIZER_PATH=/iopsstor/scratch/cscs/djanjetovic/tokenizer_cache/apertus
+TOKENIZER_PATH=/iopsstor/scratch/cscs/djanjetovic/tokenizer_cache/apertus/tokenizer.json
 
 echo "Starting tokenization with datatrove"
 echo "  Format:    $FORMAT"
@@ -112,6 +112,8 @@ if __name__ == '__main__':
     executor.run()
 EOF
 
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
 python3 $TOKENIZE_SCRIPT
 
 echo "Done tokenizing $FORMAT"
