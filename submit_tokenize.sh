@@ -54,7 +54,7 @@ echo "  Output:    $OUTPUT_DIR"
 echo "  Tokenizer: $TOKENIZER_PATH"
 
 # Validate that the tokenizer cache exists
-if [ ! -d "$TOKENIZER_PATH" ]; then
+if [ ! -f "$TOKENIZER_PATH" ]; then
     echo "ERROR: Tokenizer cache not found at $TOKENIZER_PATH"
     echo "Run the following on the LOGIN NODE first:"
     echo "  python -c \""
