@@ -18,8 +18,9 @@
 #   2. Replaced python3 - <<EOF heredoc with a real .py file written to disk.
 #      The heredoc caused a forkserver crash because worker processes tried to
 #      re-import <stdin> which is not a real file on disk.
+#   3. The tokenizer path is now a local file path instead of a HuggingFace Hub name, to avoid silent download failures on compute nodes with no internet access. 
 #
-# Usage (run once per format, after all serialize jobs for that format complete):
+# Usage:
 #   sbatch submit_tokenize.sh csv
 #   sbatch submit_tokenize.sh sql_schema
 #   sbatch submit_tokenize.sh keyvalue
@@ -102,6 +103,7 @@ if __name__ == '__main__':
             MegatronDocumentTokenizer(
                 output_folder="$OUTPUT_DIR",
                 tokenizer_name_or_path="$TOKENIZER_PATH",
+                eos_token=None,
                 save_filename="train",
             ),
         ],

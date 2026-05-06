@@ -13,10 +13,6 @@
 #   sbatch submit_tabular_ablation.sh markdown
 #   sbatch submit_tabular_ablation.sh json
 #
-#   Or loop over all five formats:
-#     for fmt in csv sql_schema keyvalue markdown json; do
-#         sbatch submit_tabular_ablation.sh $fmt
-#     done
 #
 # ── Token target note ─────────────────────────────────────────────────────────
 # TARGET_TOKENS is set to 10B below (see CHANGE note).

@@ -5,23 +5,12 @@
 #   Runs serialize_t4.py on T4 chunks in parallel via a SLURM array job.
 #   Each task handles one chunk zip file and writes one .jsonl output file.
 #
-#
-# ── Two-phase usage ───────────────────────────────────────────────────────────
-# PHASE A — Test run (chunk 0 only, ~3-4h):
-#   sbatch --array=0 submit_serialize.sh csv
-#   Then inspect logs: grep "Tokens written" logs/serialize-*-0.out
-#   This tells you the real per-chunk token yield.
-#
-# PHASE B — Full run (all 76 chunks, after Phase A confirms output):
-#   for fmt in csv sql_schema keyvalue markdown json; do
-#       sbatch --array=0-75 submit_serialize.sh $fmt
-#   done
-#
-# Output per format:
-#   /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/jsonl/{format}/chunk-0000.jsonl
-#   ...
-#   /iopsstor/scratch/cscs/djanjetovic/tabular_ablation/jsonl/{format}/chunk-0075.jsonl
-# =============================================================================
+# Usage:
+#   submit_serialize.sh csv
+#   submit_serialize.sh sql_schema
+#   submit_serialize.sh keyvalue
+#   submit_serialize.sh markdown
+#   submit_serialize.sh json
 
 # ── SLURM job configuration ───────────────────────────────────────────────────
 
