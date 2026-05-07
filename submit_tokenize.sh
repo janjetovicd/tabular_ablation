@@ -108,7 +108,7 @@ if __name__ == '__main__':
             ),
         ],
         tasks=28,
-        workers=8,
+        workers=4,
         logging_dir="$OUTPUT_DIR/logs",
     )
     executor.run()
