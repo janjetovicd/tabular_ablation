@@ -12,24 +12,11 @@
 #   sbatch submit_tabular_ablation.sh keyvalue
 #   sbatch submit_tabular_ablation.sh markdown
 #   sbatch submit_tabular_ablation.sh json
-#
-#
-# ── Token target note ─────────────────────────────────────────────────────────
-# TARGET_TOKENS is set to 10B below (see CHANGE note).
-# If all 76 T4 chunks produce more or fewer tokens than expected, update this
-# value after serialization completes:
-#   total_tokens=$(cat logs/serialize-*_*.out | grep "Tokens written" | \
-#                  awk '{sum += $NF} END {print sum}')
-# Then set TARGET_TOKENS=$total_tokens * 0.983  (the train fraction).
-# =============================================================================
 
-# ── SLURM job configuration ───────────────────────────────────────────────────
+# SLURM job configuration
 
 #SBATCH --account=a139
 #SBATCH --time=12:00:00
-# CHANGE: was 06:00:00. Training 10B tokens at GBS=256, SEQ=4096 → ~9,300 steps.
-# At a conservative 2-3 seconds/step on 32 GPUs, that is 5-8 hours.
-# 12h gives a safe buffer for startup, checkpointing, and eval overhead.
 #SBATCH --job-name=tabular-ablation
 #SBATCH --output=/iopsstor/scratch/cscs/djanjetovic/apertus/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/djanjetovic/apertus/Megatron-LM/logs/slurm/training/%x-%j.err
@@ -40,7 +27,7 @@
 
 echo "START TIME: $(date)"
 
-# ── Experiment config ─────────────────────────────────────────────────────────
+# Experiment config
 
 FORMAT_NAME=${1:-csv}
 
@@ -52,40 +39,52 @@ fi
 
 echo "  Format: $FORMAT_NAME"
 
-# ── Container ─────────────────────────────────────────────────────────────────
+# Container
 
 CONTAINER_ENV=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tabular_container.toml
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# Paths
 
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/djanjetovic/Megatron-LM
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/djanjetovic/datasets/cache
-TABULAR_DATA=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/$FORMAT_NAME/train
-DATA_PATH_LIST=(1.0 $TABULAR_DATA)
 
-# ── Training hyperparameters ──────────────────────────────────────────────────
+# Build data path list from all non-empty shards (00-23)
+
+BASE_DATA_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/$FORMAT_NAME
+DATA_PATH_LIST=()
+for i in $(seq -f "%05g" 0 23); do
+    shard="${BASE_DATA_DIR}/train_${i}_tokens"
+    if [ -s "${shard}.bin" ]; then
+        DATA_PATH_LIST+=(1.0 "$shard")
+    else
+        echo "WARNING: Skipping missing or empty shard: ${shard}.bin" # Shards 24-27 are 0-byte placeholders from empty ranks — skip them.
+    fi
+done
+
+if [ ${#DATA_PATH_LIST[@]} -eq 0 ]; then
+    echo "ERROR: No valid shards found for format '$FORMAT_NAME' in $BASE_DATA_DIR"
+    exit 1
+fi
+
+echo "  Found $((${#DATA_PATH_LIST[@]} / 2)) valid shards for $FORMAT_NAME"
+
+# Training hyperparameters
 
 MBS=2
 GBS=256
 SEQ_LEN=4096
 CHECKPOINT_STEPS=500
 
-# CHANGE: TARGET_TOKENS updated from 30_000_000_000 to 10_000_000_000.
-# Reason: each T4 chunk yields ~130-150M tokens after 3800-token row sampling
-# (verified from chunk-0000 which has 40,595 parquet files, 99% of tables
-# exceed 4096 tokens unsampled). All 76 chunks × ~140M = ~10.6B tokens max.
-# 30B is not achievable from T4 alone per format.
-# UPDATE THIS VALUE after serialization completes based on actual token counts:
-#   grep "Approx tokens" logs/serialize-*_*.out | awk -F: '{print $NF}' | \
-#   awk '{sum += $1} END {printf "Total: %.2fB\n", sum}'
+# NOTE: With 12h wall time you will hit ~10-15B tokens before the job ends.
+# The job will checkpoint every 500 steps so you can resume with RESUME_TRAINING=true.
+# To check your actual wall time limit with: sacctmgr show qos
 TARGET_TOKENS=30000000000
 
 TRAINING_STEPS=$((TARGET_TOKENS / (GBS * SEQ_LEN)))
-# = 10B / (256 × 4096) = 10B / 1,048,576 ≈ 9,537 steps
 
 RESUME_TRAINING=false
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# Logging setup
 
 PROJECT_NAME=tabular-ablation
 EXP_NAME=tabular-$FORMAT_NAME-1p5b
@@ -95,7 +94,7 @@ CKPT_DIR=$EXP_DIR/checkpoints
 LOGGING_DIR=$EXP_DIR/logging
 TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
 
-# ── Environment variables ─────────────────────────────────────────────────────
+# Environment variables
 
 export WANDB_API_KEY=$(grep -A2 "api.wandb.ai" ~/.netrc 2>/dev/null | grep password | awk '{print $2}')
 export WANDB__FILE_STREAM_RETRY_MAX=10
@@ -107,7 +106,7 @@ export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=8888
 export WORLD_SIZE=$SLURM_NPROCS
 
-# ── Model architecture — 1.54B proxy model ────────────────────────────────────
+# Model architecture — 1.54B proxy model
 
 NETWORK_SIZE_ARGS=(
     --num-layers 32
@@ -159,9 +158,7 @@ TRAINING_ARGS=(
 )
 
 INITIALIZATION_ARGS=(
-    --seed 42
-    # CRITICAL: same seed for all 5 format runs — any difference in val loss
-    # is due to the format, not random initialization.
+    --seed 42 #Same seed for all 5 format runs so any difference in val loss is due to the format, not random initialization
     --init-method-std 0.008944
 )
 
@@ -172,7 +169,7 @@ LEARNING_RATE_ARGS=(
     --lr-warmup-iters 100
 )
 
-# ── Checkpoint loading ────────────────────────────────────────────────────────
+# Checkpoint loading
 
 if [ "$RESUME_TRAINING" = true ]; then
     echo "RESUME MODE: Loading from $CKPT_DIR"
@@ -204,23 +201,15 @@ DISTRIBUTED_ARGS=(
     --overlap-param-gather
 )
 
-# CHANGE: tokenizer path changed from HuggingFace model name to local cached path.
-# The old value was: --tokenizer-model swiss-ai/Apertus-70B-2509
-# This fails silently on compute nodes because HF_HUB_OFFLINE=1 is set above
-# and Alps compute nodes have no internet access. Use the locally cached copy
-# that was saved on the login node in step 1 of the execution plan.
 TOKENIZER_ARGS=(
     --tokenizer-type HuggingFaceTokenizer
     --tokenizer-model /iopsstor/scratch/cscs/djanjetovic/tokenizer_cache/apertus
 )
 
-# ── Data arguments ────────────────────────────────────────────────────────────
+# Data arguments
 
 DATA_ARGS=(
     --split 98.3,1.7,0
-    # CONFIRMED CORRECT per PhD student recommendation.
-    # 98.3% train / 1.7% validation / 0% test.
-    # Validation split generates the NLL/perplexity curves compared across formats.
     --seq-length $SEQ_LEN
     --reset-position-ids
     --no-create-attention-mask-in-dataloader
@@ -228,14 +217,14 @@ DATA_ARGS=(
     --num-workers 32
 )
 
-# ── Create directories ────────────────────────────────────────────────────────
+# Create directories
 
 mkdir -p $CKPT_DIR $PROJECT_DIR $LOGGING_DIR $TENSORBOARD_DIR
 export PYTHONPATH=$MEGATRON_LM_DIR
 
 DATA_ARGS="${DATA_ARGS[@]} --data-path ${DATA_PATH_LIST[@]} --data-cache-path $DATASET_CACHE_DIR"
 
-# ── Build training command ────────────────────────────────────────────────────
+# Build training command 
 
 TRAINING_CMD="python3 $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${TRANSFORMER_ENGINE_ARGS[@]} \
@@ -251,20 +240,22 @@ TRAINING_CMD="python3 $MEGATRON_LM_DIR/pretrain_gpt.py \
     ${TOKENIZER_ARGS[@]} \
     $DATA_ARGS"
 
-# ── WandB logging ─────────────────────────────────────────────────────────────
+# WandB logging
 
 if [ -n "$WANDB_API_KEY" ]; then
     echo "WandB logging enabled. Project: $PROJECT_NAME, Experiment: $EXP_NAME"
     TRAINING_CMD="$TRAINING_CMD \
         --wandb-save-dir $LOGGING_DIR \
         --wandb-project $PROJECT_NAME \
-        --wandb-exp-name $EXP_NAME-$SLURM_JOB_ID"
+        --wandb-exp-name $EXP_NAME"
+    # NOTE: removed $SLURM_JOB_ID from exp name so resumed runs continue
+    # the same WandB entry instead of creating a new one each time.
 else
     export WANDB_MODE=disabled
     echo "No WandB API key found. Logging disabled."
 fi
 
-# ── Launch training ───────────────────────────────────────────────────────────
+# Launch training
 
 srun \
     --cpus-per-task $SLURM_CPUS_PER_TASK \
