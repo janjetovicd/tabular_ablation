@@ -45,7 +45,7 @@ CONTAINER_ENV=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tabular_contai
 
 # Paths
 
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/djanjetovic/Megatron-LM
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/djanjetovic/swiss-megatron
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/djanjetovic/datasets/cache
 
 # Build data path list from all non-empty shards (00-23)
