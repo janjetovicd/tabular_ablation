@@ -204,6 +204,7 @@ DISTRIBUTED_ARGS=(
 TOKENIZER_ARGS=(
     --tokenizer-type HuggingFaceTokenizer
     --tokenizer-model /iopsstor/scratch/cscs/djanjetovic/tokenizer_cache/apertus
+    --trust-remote-code
 )
 
 # Data arguments
