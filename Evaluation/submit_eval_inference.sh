@@ -114,8 +114,8 @@ fi
 #     The echo lines confirm in the .out log whether cleanup actually ran.
 srun --ntasks=1 bash -c "
     echo 'Cleaning /dev/shm/$USER on node \$(hostname)...'
-    rm -rf /dev/shm/$USER && echo 'Cleanup OK' || echo 'Cleanup had nothing to remove or failed (non-fatal)'
-"
+    rm -rf /dev/shm/$USER && echo 'Cleanup OK' || echo 'Cleanup skipped'
+" || true
 
 # Explicit failure check on the container srun.
 #     Previously if this step failed, bash kept going and printed "Done"
