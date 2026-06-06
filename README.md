@@ -2,7 +2,7 @@
 
 Serialization format ablation study for large-scale tabular pretraining. Part of a semester project at EPFL / CSCS.
 
-**Goal:** Train 5 small proxy models (1.54B parameters, ~30B tokens each) on the [T4 dataset](https://huggingface.co/datasets/mlfoundations/t4), one per serialization format, and pick the best format for full-scale pretraining.
+**Goal:** Train 5 small proxy models (1.54B parameters, ~30B tokens each) on the [T4 dataset](https://huggingface.co/datasets/mlf oundations/t4), one per serialization format, and evaluate which format leads to the best downstream tabular understanding — informing the format choice for full-scale Apertus pretraining.
 
 **Formats under test:** `csv`, `keyvalue`, `markdown`, `json`, `sql_schema`
 
@@ -12,20 +12,23 @@ Serialization format ablation study for large-scale tabular pretraining. Part of
 
 ```
 T4 parquet chunks (zip)
-        │
-        ▼
-[Phase 2a] serialize_t4.py       → .jsonl files (one line per table segment)
-        │
-        ▼
-[Phase 2b] submit_tokenize.sh    → .bin / .idx files (Megatron binary format)
-        │
-        ▼
-[Phase 2c] submit_tabular_ablation.sh  → 5 proxy model checkpoints
-        │
-        ▼
-[Phase 2d] Compare validation loss + downstream task accuracy → winning format
+│
+▼
+[Phase 1] serialize_t4.py        → .jsonl files (one line per table segment)
+│
+▼
+[Phase 2] submit_tokenize.sh     → .bin / .idx files (Megatron binary format)
+│
+▼
+[Phase 3] submit_tabular_ablation.sh  → 5 proxy model checkpoints
+│
+▼
+[Phase 4] Evaluation             → winning format
+├── prepare_eval_data.py       → prompts + ground truth from held-out T4 tables
+└── run_eval.sh                → log-prob scoring → accuracy per format
 ```
 
+---
 ---
 
 ## Scripts
@@ -35,7 +38,7 @@ T4 parquet chunks (zip)
 Reads T4 parquet files from a chunk zip archive, cleans and serializes every table using **Tabular Chunking** — splitting each table into multiple 3800-token segments so no row is discarded.
 
 **Key design decisions:**
-- **Tabular Chunking**: each table is split into multiple 3800-token segments using greedy row accumulation with per-row token pre-computation. Writes one {"text": "..."} JSON line per segment. This ensures no table data is discarded and that every row of every table is used.
+- **Tabular Chunking**: each table is split into multiple 3800-token segments using greedy row accumulation with per-row token pre-computation. Writes one `{"text": "..."}` JSON line per segment.
 - **Header/schema repetition**: every segment includes the column header or SQL schema so the model always has semantic context.
 - **Deterministic shuffle**: rows are shuffled with a seed derived from the filename (MD5 hash), ensuring all 5 format runs see identical row orderings for a fair comparison.
 - **Cleaning**: drops artifact columns (`Unnamed:*`, `index`), all-null columns, and columns with any cell exceeding 500 characters (avoids free-text blobs and base64 data swamping the token budget).
@@ -123,6 +126,39 @@ Container definition for GPU training jobs. Specifies `ngc-nemo:25.11.01-alps3`.
 
 ---
 
+## Evaluation
+
+Validation loss curves during training are tracked via WandB. For downstream evaluation, we use a **BLiMP-style log-probability scoring** approach on held-out T4 data (chunks 24–25, not seen during training).
+
+**Methodology:**
+1. Sample 300 tables from the held-out chunks.
+2. For each table and each format, build a context prompt from rows 0..k-1 (fitting within the 3800-token budget), holding out the last row.
+3. Use LLaMA-3.1-8B to generate a *statement* (correct last-row completion) and a *distractor* (plausible but incorrect completion) for each table.
+4. At inference time, compute `log P(statement | table_context)` and `log P(distractor | table_context)` using each of the 5 proxy models.
+5. The model assigns higher probability to the correct statement → correct. Accuracy across 300 tables per format determines the winning serialization.
+
+This evaluates whether the model has learned tabular structure well enough to prefer factually correct completions over plausible distractors.
+
+### `Evaluation/prepare_eval_data.py`
+
+Prepares the evaluation dataset. Scans T4 chunks 24–25, filters valid tables (≥2 rows, header fits token budget across all 5 formats), and samples 300 tables with a fixed seed. For each table, builds context prompts in all 5 formats simultaneously and saves the held-out last row as ground truth.
+
+**Output** (written to `/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/eval/`):
+- `prompts_{format}.jsonl` — one `{table_id, prompt}` per table per format
+- `ground_truth.jsonl` — `{table_id, ground_truth_dict, col_dtypes}` per table
+- `dataframes/{table_id}.pkl` — cleaned DataFrames for cross-format consistency checks
+
+**Usage** (login node, CPU only, ~10 min):
+```bash
+python Evaluation/prepare_eval_data.py
+```
+
+### `run_eval.sh`
+
+SLURM job script that runs inference-time log-probability scoring on the prepared prompts. Requires 1 GPU, 12h wall time.
+
+---
+
 ## Data
 
-**Source:** [mlfoundations/t4](https://huggingface.co/datasets/mlfoundations/t4) — a large-scale collection of tables scraped from the web, stored as parquet files organized in 76 chunks.
+**Source:** [mlf oundations/t4](https://huggingface.co/datasets/mlf oundations/t4) — a large-scale collection of tables scraped from the web, stored as parquet files organized in 76 chunks. Chunks 0–23 used for training; chunks 24–25 held out for evaluation.
