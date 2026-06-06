@@ -39,13 +39,15 @@ from collections import defaultdict
 _p = argparse.ArgumentParser(add_help=False)
 _p.add_argument('--format', required=True,
                 choices=['csv', 'json', 'keyvalue', 'markdown', 'sql_schema'])
-_p.add_argument('--ckpt-dir', required=True,
-                help='Path to preserved checkpoint directory '
-                     '(the iter_XXXXXX parent folder, e.g. $HOME/tabular_ablation_checkpoints/tabular-csv-1p5b)')
+_p.add_argument('--ckpt-dir', default='dummy',
+                help='Path to checkpoint directory. Ignored in --smoke-test mode.')
 _p.add_argument('--pairs-dir', required=True,
                 help='Directory containing pairs_{fmt}.jsonl files.')
 _p.add_argument('--output-dir', required=True)
 _p.add_argument('--max-seq-len', type=int, default=4096)
+_p.add_argument('--smoke-test', action='store_true',
+                help='Skip Megatron and model entirely. Uses random scores to validate '
+                     'I/O, pair loading, and output writing. Safe to run on CPU/login node.')
 eval_args, _ = _p.parse_known_args()
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -116,6 +118,50 @@ sys.argv = [
     '--train-iters', '0',         # no training, eval only
     '--distributed-backend', 'nccl',
 ]
+
+# ── Smoke test mode ───────────────────────────────────────────────────────────
+# Run with: python3 run_eval_inference.py --smoke-test --format csv \
+#               --pairs-dir /path/to/eval --output-dir /tmp/smoke_out
+# No GPUs, no checkpoint, no Megatron needed. Validates I/O only.
+
+if eval_args.smoke_test:
+    import random
+    log.info('SMOKE TEST MODE — skipping Megatron, model, and checkpoint.')
+    log.info(f'Reading pairs from {PAIRS_PATH}')
+
+    if not os.path.exists(PAIRS_PATH):
+        log.error(f'Pairs file not found: {PAIRS_PATH}')
+        sys.exit(1)
+
+    with open(PAIRS_PATH) as f:
+        records = [json.loads(line) for line in f if line.strip()]
+    log.info(f'Loaded {len(records)} pairs.')
+
+    results = []
+    for record in records[:5]:   # only test 5 pairs
+        nll_s = random.uniform(1.0, 5.0)
+        nll_d = random.uniform(1.0, 5.0)
+        results.append({
+            'table_id':       record['table_id'],
+            'type':           record.get('type', 'unknown'),
+            'statement':      record['statement'],
+            'distractor':     record['distractor'],
+            'nll_statement':  nll_s,
+            'nll_distractor': nll_d,
+            'correct':        nll_s < nll_d,
+        })
+
+    with open(RESULTS_PATH, 'w') as f:
+        for r in results:
+            f.write(json.dumps(r) + '\n')
+
+    summary = {'smoke_test': True, 'n_pairs_tested': len(results), 'results_path': RESULTS_PATH}
+    with open(SUMMARY_PATH, 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    log.info(f'SMOKE TEST PASSED — wrote {len(results)} results to {RESULTS_PATH}')
+    log.info(f'Summary: {SUMMARY_PATH}')
+    sys.exit(0)
 
 # ── Megatron initialization ───────────────────────────────────────────────────
 
