@@ -41,7 +41,7 @@ LLAMA_PATH = (
     "snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
 )
 CHUNK_IDS        = [24, 25]
-N_TABLES         = 100
+N_TABLES         = 300
 RANDOM_SEED      = 42
 TOKEN_BUDGET     = 3800
 FORMATS          = ["csv", "json", "keyvalue", "markdown", "sql_schema"]
@@ -230,6 +230,28 @@ def save_checkpoint(table_id: str) -> None:
 
 # ── Serialization helpers ──────────────────────────────────────────────────────
 
+def _fit_rows(fn, df: pd.DataFrame, tokenizer, budget: int) -> str | None:
+    """Binary search for the largest prefix of df whose serialization fits in budget.
+    O(log n) tokenizer calls instead of O(n)."""
+    n = len(df)
+    if n == 0:
+        return None
+    lo, hi = 1, n
+    best: str | None = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        try:
+            text = fn(df.iloc[:mid])
+            if len(tokenizer.encode(text)) <= budget:
+                best = text
+                lo = mid + 1   # try more rows
+            else:
+                hi = mid - 1   # too many rows
+        except Exception:
+            hi = mid - 1
+    return best
+
+
 def serialize_table_all_formats(
     df: pd.DataFrame,
     schema,
@@ -241,37 +263,26 @@ def serialize_table_all_formats(
         "markdown": serialize_markdown,
         "json":     serialize_json_records,
     }
-    result: dict[str, str | None] = {}
+    result: dict[str, str | None] = {
+        fmt: _fit_rows(fn, df, tokenizer, TOKEN_BUDGET)
+        for fmt, fn in fn_map.items()
+    }
 
-    for fmt, fn in fn_map.items():
-        result[fmt] = None
-        for n_rows in range(len(df), 0, -1):
-            sub = df.iloc[:n_rows]
-            try:
-                text = fn(sub)
-                if len(tokenizer.encode(text)) <= TOKEN_BUDGET:
-                    result[fmt] = text
-                    break
-            except Exception:
-                continue
-
-    result["sql_schema"] = None
     if schema is not None:
         try:
-            for n_rows in range(len(df), 0, -1):
-                sub = df.iloc[:n_rows]
-                text = serialize_sql_schema(sub, schema)
-                if len(tokenizer.encode(text)) <= TOKEN_BUDGET:
-                    result["sql_schema"] = text
-                    break
+            result["sql_schema"] = _fit_rows(
+                lambda sub: serialize_sql_schema(sub, schema), df, tokenizer, TOKEN_BUDGET
+            )
         except Exception as e:
             log.warning(f"sql_schema serialization failed: {e}")
+            result["sql_schema"] = None
     else:
-        # No arrow schema available (e.g. smoke test with stub) — fall back to CSV
+        # No arrow schema (smoke test stub) — fall back to CSV
         try:
             result["sql_schema"] = serialize_csv(df)
         except Exception as e:
             log.warning(f"sql_schema fallback (csv) failed: {e}")
+            result["sql_schema"] = None
 
     return result
 
@@ -292,15 +303,21 @@ def truncate_to_budget(
     fn = serializers.get(fmt)
     if fn is None:
         return df
-    for n_rows in range(len(df), 0, -1):
-        sub = df.iloc[:n_rows]
+    # Binary search: same O(log n) fix as serialize_table_all_formats
+    n = len(df)
+    lo, hi, best_n = 1, n, 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
         try:
-            text = fn(sub)
+            text = fn(df.iloc[:mid])
             if len(tokenizer.encode(text)) <= budget:
-                return sub
+                best_n = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
         except Exception:
-            continue
-    return df.iloc[:1]
+            hi = mid - 1
+    return df.iloc[:best_n]
 
 # ── LLaMA generation ──────────────────────────────────────────────────────────
 
