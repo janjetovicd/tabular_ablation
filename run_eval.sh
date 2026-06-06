@@ -4,7 +4,7 @@
 #SBATCH --gpus=1
 #SBATCH --time=12:00:00
 #SBATCH --job-name=prepare_eval
-#SBATCH --output=prepare_eval_%j.out
+#SBATCH --output=logs/prepare_eval_%j.out
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate base

@@ -460,20 +460,16 @@ def main():
         from transformers import AutoModelForCausalLM
         from transformers import pipeline as hf_pipeline
 
-        cuda_available = torch.cuda.is_available()
-        dtype = torch.bfloat16 if cuda_available else torch.float32
-        log.info(f"CUDA available: {cuda_available} — using {'bfloat16 on GPU' if cuda_available else 'float32 on CPU (slower)'}")
+        log.info("CPU mode — using float32 (no GPU)")
         log.info("Loading LLaMA model weights...")
         t_load = time.time()
         model = AutoModelForCausalLM.from_pretrained(
             LLAMA_PATH,
-            torch_dtype=dtype,
-            device_map="auto",
+            torch_dtype=torch.float32,
+            device_map="cpu",
         )
         log.info(f"Model loaded in {time.time()-t_load:.1f}s")
         log.info(f"Model device: {next(model.parameters()).device}")
-        if torch.cuda.is_available():
-            log.info(f"GPU memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
         # FIX: clear the model's baked-in max_length=20 from generation_config
         # so it doesn't conflict with our max_new_tokens=900

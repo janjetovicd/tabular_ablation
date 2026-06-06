@@ -1,5 +1,27 @@
+# Core dumps
 /core_clariden-ln002_234582
 /core_clariden-ln002_234937
-/jsonl
+core_clariden-*
+
+# SLURM output logs
 /logs
+*.out
+
+# Data — never commit these
+/t4_data
+/jsonl
 /tokenized
+
+# Eval outputs
+/eval
+/eval_cpu
+/eval_test
+*.pkl
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+
+# Mac
+.DS_Store
