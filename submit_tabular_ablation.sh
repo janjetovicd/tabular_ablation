@@ -35,7 +35,7 @@ echo "Format: $FORMAT_NAME"
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/djanjetovic/swiss-megatron
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/djanjetovic/swiss-megatron-new
 ABLATION_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/djanjetovic/datasets/cache
 CONTAINER_ENV=$ABLATION_DIR/tabular_container.toml
