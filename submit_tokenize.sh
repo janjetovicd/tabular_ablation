@@ -44,8 +44,13 @@ fi
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-JSONL_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/jsonl/$FORMAT
-OUTPUT_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/tokenized/$FORMAT
+# STORE: permanent, backed-up project storage (no auto-cleanup). Read the
+# serialized JSONL from store and write the tokenized .bin/.idx back to store —
+# both are pre-processed datasets we don't want to regenerate.
+STORE_DIR=/capstor/store/cscs/swissai/a139/djanjetovic/tabular_ablation
+
+JSONL_DIR=$STORE_DIR/jsonl/$FORMAT
+OUTPUT_DIR=$STORE_DIR/tokenized/$FORMAT
 TOKENIZER_PATH=/iopsstor/scratch/cscs/djanjetovic/tokenizer_cache/apertus/tokenizer.json
 
 echo "Starting tokenization with datatrove"

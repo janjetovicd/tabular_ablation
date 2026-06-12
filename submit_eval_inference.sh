@@ -48,11 +48,16 @@ echo "Checkpoint: $CKPT_DIR"
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/djanjetovic/swiss-megatron
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/djanjetovic/swiss-megatron-new
 ABLATION_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation
 CONTAINER_ENV=$ABLATION_DIR/tabular_container.toml
-PAIRS_DIR=$ABLATION_DIR/eval
-OUTPUT_DIR=$ABLATION_DIR/eval_results
+
+# STORE: permanent, backed-up project storage. Read eval pairs from store and
+# write eval results to store so they survive scratch cleanup and stay available
+# for analysis. Scratch (/iopsstor) purges anything untouched for 14 days.
+STORE_DIR=/capstor/store/cscs/swissai/a139/djanjetovic/tabular_ablation
+PAIRS_DIR=$STORE_DIR/eval
+OUTPUT_DIR=$STORE_DIR/eval_results
 
 mkdir -p $OUTPUT_DIR
 mkdir -p $MEGATRON_LM_DIR/logs/slurm/training
@@ -94,6 +99,6 @@ srun \
     --environment=$CONTAINER_ENV \
     --network=disable_rdzv_get \
     -lu \
-    bash -c "RANK=\$SLURM_PROCID LOCAL_RANK=\$SLURM_LOCALID $EVAL_CMD"
+    bash -c "RANK=\$SLURM_PROCID LOCAL_RANK=\$SLURM_LOCALID PYTHONPATH=$MEGATRON_LM_DIR MEGATRON_LM_DIR=$MEGATRON_LM_DIR $EVAL_CMD"
 
 echo "END TIME: $(date)"

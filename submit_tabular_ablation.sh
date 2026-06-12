@@ -40,9 +40,16 @@ ABLATION_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/djanjetovic/datasets/cache
 CONTAINER_ENV=$ABLATION_DIR/tabular_container.toml
 
+# STORE: permanent, backed-up project storage (no auto-cleanup). Tokenized data
+# is read from here, and final checkpoints + logs are staged out to here after
+# training (see the stage-out block at the end of this script). Scratch
+# (/iopsstor) purges anything untouched for 14 days.
+STORE_DIR=/capstor/store/cscs/swissai/a139/djanjetovic/tabular_ablation
+
 # ── Data shards ────────────────────────────────────────────────────────────────
 
-BASE_DATA_DIR=$ABLATION_DIR/tokenized/$FORMAT_NAME
+# Read tokenized shards from permanent store (written there by submit_tokenize.sh).
+BASE_DATA_DIR=$STORE_DIR/tokenized/$FORMAT_NAME
 DATA_PATH_LIST=()
 for i in $(seq -f "%05g" 0 23); do
     shard="${BASE_DATA_DIR}/train_${i}_tokens"
@@ -253,8 +260,19 @@ if [ $TRAIN_EXIT -eq 0 ]; then
     echo "Submitting eval job for $FORMAT_NAME ..."
     sbatch $ABLATION_DIR/submit_eval_inference.sh $FORMAT_NAME $CKPT_DIR
     echo "Eval job submitted."
+
+    # ── Stage-out checkpoints + logs to permanent store ─────────────────────────
+    # Training wrote checkpoints to scratch (fast, frequent writes). Now copy the
+    # whole experiment dir (checkpoints + logging + tensorboard) to backed-up
+    # store so it survives the 14-day scratch cleanup and stays available for
+    # later analysis and re-evaluation. This runs on the dedicated xfer partition.
+    STORE_CKPT_DEST=$STORE_DIR/checkpoints/$EXP_NAME
+    echo "Submitting stage-out: $EXP_DIR -> $STORE_CKPT_DEST"
+    sbatch --job-name=stage_out_$FORMAT_NAME \
+        $ABLATION_DIR/stage.sbatch "$EXP_DIR" "$STORE_CKPT_DEST"
+    echo "Stage-out job submitted."
 else
-    echo "Training failed — not submitting eval."
+    echo "Training failed — not submitting eval or stage-out."
 fi
 
 echo "END TIME: $(date)"

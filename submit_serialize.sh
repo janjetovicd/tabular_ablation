@@ -50,10 +50,15 @@ fi
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
+# STORE: permanent, backed-up project storage (no auto-cleanup). Serialized
+# JSONL is a pre-processed dataset we don't want to regenerate, so write it here
+# directly instead of to scratch. Scratch (/iopsstor) purges files after 14 days.
+STORE_DIR=/capstor/store/cscs/swissai/a139/djanjetovic/tabular_ablation
+
 T4_BASE=/capstor/store/cscs/swissai/a139/datasets/mlfoundations_t4_full
 CHUNK=$(printf "chunk-%04d" $SLURM_ARRAY_TASK_ID)
 CHUNK_ZIP=$T4_BASE/${CHUNK}.zip
-OUTPUT_DIR=/iopsstor/scratch/cscs/djanjetovic/tabular_ablation/jsonl/$FORMAT
+OUTPUT_DIR=$STORE_DIR/jsonl/$FORMAT
 
 # CHANGE: Pre-cached local tokenizer path.
 # Compute nodes have no internet — HuggingFace Hub downloads fail silently.
