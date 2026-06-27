@@ -2,6 +2,8 @@
 
 Serialization format ablation study for large-scale tabular pretraining. Part of a semester project at EPFL / CSCS.
 
+**Report:** [Tabular Datasets for Posttraining Pipeline of Apertus](https://github.com/janjetovicd/tabular_ablation/blob/main/Apertus_Semester_Project_Report.pdf)
+
 **Goal:** Train 5 small proxy models (1.54B parameters, 48B tokens each) on the [T4 dataset](https://huggingface.co/datasets/mlfoundations/t4), one per serialization format, and evaluate which format leads to the best downstream tabular understanding — informing the format choice for full-scale Apertus pretraining.
 
 **Formats under test:** `csv`, `keyvalue`, `markdown`, `json`, `sql_schema`
